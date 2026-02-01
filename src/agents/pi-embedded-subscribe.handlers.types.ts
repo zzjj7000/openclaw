@@ -36,7 +36,12 @@ export type EmbeddedPiSubscribeState = {
 
   deltaBuffer: string;
   blockBuffer: string;
-  blockState: { thinking: boolean; final: boolean; inlineCode: InlineCodeState };
+  blockState: {
+    thinking: boolean;
+    final: boolean;
+    inlineCode: InlineCodeState;
+    partialTagBuffer?: string;
+  };
   lastStreamedAssistant?: string;
   lastStreamedReasoning?: string;
   lastBlockReplyText?: string;
@@ -73,7 +78,12 @@ export type EmbeddedPiSubscribeContext = {
   emitToolOutput: (toolName?: string, meta?: string, output?: string) => void;
   stripBlockTags: (
     text: string,
-    state: { thinking: boolean; final: boolean; inlineCode?: InlineCodeState },
+    state: {
+      thinking: boolean;
+      final: boolean;
+      inlineCode?: InlineCodeState;
+      partialTagBuffer?: string;
+    },
   ) => string;
   emitBlockChunk: (text: string) => void;
   flushBlockReplyBuffer: () => void;
@@ -98,5 +108,5 @@ export type EmbeddedPiSubscribeContext = {
 
 export type EmbeddedPiSubscribeEvent =
   | AgentEvent
-  | { type: string; [k: string]: unknown }
+  | { type: string;[k: string]: unknown }
   | { type: "message_start"; message: AgentMessage };

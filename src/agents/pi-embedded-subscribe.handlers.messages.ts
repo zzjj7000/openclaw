@@ -19,6 +19,9 @@ import {
 } from "./pi-embedded-utils.js";
 import { createInlineCodeState } from "../markdown/code-spans.js";
 
+// Use a robust regex that handles newlines and case insensitivity globaly to avoid recompilation
+const ROBUST_THINKING_RE = /<\s*(\/?)\s*(?:think(?:ing)?|thought|antthinking)\s*>/gis;
+
 export function handleMessageStart(
   ctx: EmbeddedPiSubscribeContext,
   evt: AgentEvent & { message: AgentMessage },
@@ -44,18 +47,33 @@ export function handleMessageUpdate(
   if (msg?.role !== "assistant") return;
 
   const assistantEvent = evt.assistantMessageEvent;
+
+  /* Removed [KIMI_RAW_DEBUG] */
+
   const assistantRecord =
     assistantEvent && typeof assistantEvent === "object"
       ? (assistantEvent as Record<string, unknown>)
       : undefined;
+
+  // [Kimi/DeepSeek Support] Extract reasoning_content from raw delta object
+  // pi-ai might pass the raw OpenAI delta object as `assistantRecord.delta`
+  const rawDeltaObj = assistantRecord?.delta as Record<string, unknown> | undefined;
+  if (rawDeltaObj && typeof rawDeltaObj === "object" && "reasoning_content" in rawDeltaObj) {
+    const r = rawDeltaObj.reasoning_content;
+    if (typeof r === "string" && r.length > 0) {
+      // Manually emit reasoning stream since standard delta extraction misses it
+      ctx.emitReasoningStream(r);
+    }
+  }
+
   const evtType = typeof assistantRecord?.type === "string" ? assistantRecord.type : "";
+
+  const delta = typeof assistantRecord?.delta === "string" ? assistantRecord.delta : "";
+  const content = typeof assistantRecord?.content === "string" ? assistantRecord.content : "";
 
   if (evtType !== "text_delta" && evtType !== "text_start" && evtType !== "text_end") {
     return;
   }
-
-  const delta = typeof assistantRecord?.delta === "string" ? assistantRecord.delta : "";
-  const content = typeof assistantRecord?.content === "string" ? assistantRecord.content : "";
 
   appendRawStream({
     ts: Date.now(),
@@ -166,27 +184,42 @@ export function handleMessageEnd(
   promoteThinkingTagsToBlocks(assistantMessage);
 
   const rawText = extractAssistantText(assistantMessage);
+  const rawThinking = extractAssistantThinking(assistantMessage);
+
+  // [DEBUG] Logs removed
+  // console.log(`[KIMI_DEBUG] Message End | Raw Text: ${JSON.stringify(rawText)}`);
+  // console.log(`[KIMI_DEBUG] Message End | Raw Thinking: ${JSON.stringify(rawThinking)}`);
+
   appendRawStream({
     ts: Date.now(),
     event: "assistant_message_end",
     runId: ctx.params.runId,
     sessionId: (ctx.params.session as { id?: string }).id,
     rawText,
-    rawThinking: extractAssistantThinking(assistantMessage),
+    rawThinking,
   });
 
-  const text = ctx.stripBlockTags(rawText, { thinking: false, final: false });
-  const rawThinking =
-    ctx.state.includeReasoning || ctx.state.streamReasoning
-      ? extractAssistantThinking(assistantMessage) || extractThinkingFromTaggedText(rawText)
-      : "";
-  const formattedReasoning = rawThinking ? formatReasoningMessage(rawThinking) : "";
-
-  const addedDuringMessage = ctx.state.assistantTexts.length > ctx.state.assistantTextBaseline;
   const chunkerHasBuffered = ctx.blockChunker?.hasBuffered() ?? false;
-  ctx.finalizeAssistantTexts({ text, addedDuringMessage, chunkerHasBuffered });
+  // If baseline is exceeded, it means we added rows during the message stream
+  const addedDuringMessage = ctx.state.assistantTexts.length > ctx.state.assistantTextBaseline;
+
+  const text = ctx.stripBlockTags(rawText, { thinking: false, final: false });
+  // Ensure we flush everything even if stripBlockTags state was stuck
+  if (!text && rawText && !ctx.state.includeReasoning) {
+    ctx.log.debug("Fallback: stripBlockTags returned empty for non-reasoning mode, flushing rawText.");
+    // If we are in off-mode and tags somehow ate everything, just show raw text without tags
+    const fallbackText = rawText.replace(ROBUST_THINKING_RE, "\n").trim();
+    ctx.finalizeAssistantTexts({ text: fallbackText, addedDuringMessage, chunkerHasBuffered });
+  } else {
+    ctx.finalizeAssistantTexts({ text, addedDuringMessage, chunkerHasBuffered });
+  }
 
   const onBlockReply = ctx.params.onBlockReply;
+  const formattedReasoning =
+    (ctx.state.includeReasoning) && rawThinking
+      ? formatReasoningMessage(rawThinking)
+      : undefined;
+
   const shouldEmitReasoning = Boolean(
     ctx.state.includeReasoning &&
     formattedReasoning &&

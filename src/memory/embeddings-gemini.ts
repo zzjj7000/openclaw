@@ -1,7 +1,10 @@
 import { requireApiKey, resolveApiKeyForProvider } from "../agents/model-auth.js";
 import { isTruthyEnvValue } from "../infra/env.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { resolveProxyFetch } from "../infra/proxy-fetch.js";
 import type { EmbeddingProvider, EmbeddingProviderOptions } from "./embeddings.js";
+
+const fetch = resolveProxyFetch();
 
 export type GeminiEmbeddingClient = {
   baseUrl: string;
@@ -118,13 +121,13 @@ export async function resolveGeminiEmbeddingClient(
   const apiKey = remoteApiKey
     ? remoteApiKey
     : requireApiKey(
-        await resolveApiKeyForProvider({
-          provider: "google",
-          cfg: options.config,
-          agentDir: options.agentDir,
-        }),
-        "google",
-      );
+      await resolveApiKeyForProvider({
+        provider: "google",
+        cfg: options.config,
+        agentDir: options.agentDir,
+      }),
+      "google",
+    );
 
   const providerConfig = options.config.models?.providers?.google;
   const rawBaseUrl = remoteBaseUrl || providerConfig?.baseUrl?.trim() || DEFAULT_GEMINI_BASE_URL;

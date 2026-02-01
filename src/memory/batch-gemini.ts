@@ -2,6 +2,9 @@ import { createSubsystemLogger } from "../logging/subsystem.js";
 import { isTruthyEnvValue } from "../infra/env.js";
 import type { GeminiEmbeddingClient } from "./embeddings-gemini.js";
 import { hashText } from "./internal.js";
+import { resolveProxyFetch } from "../infra/proxy-fetch.js";
+
+const fetch = resolveProxyFetch();
 
 export type GeminiBatchRequest = {
   custom_id: string;
@@ -344,21 +347,21 @@ export async function runGeminiEmbeddingBatches(params: {
     const completed =
       batchInfo.state && ["SUCCEEDED", "COMPLETED", "DONE"].includes(batchInfo.state)
         ? {
-            outputFileId:
-              batchInfo.outputConfig?.file ??
-              batchInfo.outputConfig?.fileId ??
-              batchInfo.metadata?.output?.responsesFile ??
-              "",
-          }
+          outputFileId:
+            batchInfo.outputConfig?.file ??
+            batchInfo.outputConfig?.fileId ??
+            batchInfo.metadata?.output?.responsesFile ??
+            "",
+        }
         : await waitForGeminiBatch({
-            gemini: params.gemini,
-            batchName,
-            wait: params.wait,
-            pollIntervalMs: params.pollIntervalMs,
-            timeoutMs: params.timeoutMs,
-            debug: params.debug,
-            initial: batchInfo,
-          });
+          gemini: params.gemini,
+          batchName,
+          wait: params.wait,
+          pollIntervalMs: params.pollIntervalMs,
+          timeoutMs: params.timeoutMs,
+          debug: params.debug,
+          initial: batchInfo,
+        });
     if (!completed.outputFileId) {
       throw new Error(`gemini batch ${batchName} completed without output file`);
     }

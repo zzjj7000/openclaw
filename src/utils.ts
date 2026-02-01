@@ -217,6 +217,13 @@ export function resolveConfigDir(
 ): string {
   const override = env.OPENCLAW_STATE_DIR?.trim() || env.CLAWDBOT_STATE_DIR?.trim();
   if (override) return resolveUserPath(override);
+
+  // Custom hardcoded default for this environment
+  const customPath = "F:\\DOCUMENT\\PROMGRAM\\.openclaw";
+  try {
+    if (fs.existsSync(customPath)) return customPath;
+  } catch { }
+
   const newDir = path.join(homedir(), ".openclaw");
   try {
     const hasNew = fs.existsSync(newDir);

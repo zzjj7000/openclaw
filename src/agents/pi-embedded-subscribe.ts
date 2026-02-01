@@ -17,7 +17,8 @@ import type {
 import type { SubscribeEmbeddedPiSessionParams } from "./pi-embedded-subscribe.types.js";
 import { formatReasoningMessage } from "./pi-embedded-utils.js";
 
-const THINKING_TAG_SCAN_RE = /<\s*(\/?)\s*(?:think(?:ing)?|thought|antthinking)\s*>/gi;
+// Use a robust regex that handles newlines and case insensitivity globaly to avoid recompilation
+const ROBUST_THINKING_RE = /<\s*(\/?)\s*(?:think(?:ing)?|thought|antthinking)\s*>/gis;
 const FINAL_TAG_SCAN_RE = /<\s*(\/?)\s*final\s*>/gi;
 const log = createSubsystemLogger("agent/embedded");
 
@@ -254,44 +255,97 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
     }
   };
 
+  // Robust stateful parser for thinking tags that handles:
+  // 1. Tags split across chunks (e.g. <th + ink>) - via state.partialTagBuffer
+  // 2. Newlines inside tags.
+  // 3. Different provider variants (<think>, <thought>, <antthinking>).
+
   const stripBlockTags = (
     text: string,
-    state: { thinking: boolean; final: boolean; inlineCode?: InlineCodeState },
+    state: {
+      thinking: boolean;
+      final: boolean;
+      inlineCode?: InlineCodeState;
+      partialTagBuffer?: string;
+    },
   ): string => {
-    if (!text) return text;
+    let input = text;
 
-    // If reasoning is explicitly disabled, treat <think> tags as normal text (pass-through).
-    // This allows models like Kimi/DeepSeek to show their thinking process in the main chat
-    // when the client doesn't support a dedicated reasoning channel.
-    if (reasoningMode === "off") return text;
+    // 0. Handle partial tags from previous chunk
+    if (state.partialTagBuffer) {
+      input = state.partialTagBuffer + text;
+      state.partialTagBuffer = undefined;
+    }
+
+    if (!input) return input;
+
+    // Detect potential partial tag at the end of the chunk (max 20 chars).
+    // This prevents tags like <think> being split as <thi + nk> across chunks.
+    const lastOpen = input.lastIndexOf("<");
+    if (lastOpen !== -1 && lastOpen > input.length - 20) {
+      const potentialTag = input.slice(lastOpen);
+      if (!potentialTag.includes(">")) {
+        // Broad check for potential thinking/final tags
+        if (/^<\s*(\/?)\s*[a-z]*$/i.test(potentialTag)) {
+          state.partialTagBuffer = potentialTag;
+          input = input.slice(0, lastOpen);
+          if (!input) return "";
+        }
+      }
+    }
+
+    if (reasoningMode === "off") {
+      // Robustly remove tags but keep content. 
+      // Replace with newline to prevent text sticking together.
+      const cleaned = input.replace(ROBUST_THINKING_RE, "\n");
+      return cleaned.startsWith("\n") ? cleaned.trimStart() : cleaned;
+    }
 
     const inlineStateStart = state.inlineCode ?? createInlineCodeState();
-    const codeSpans = buildCodeSpanIndex(text, inlineStateStart);
+    const codeSpans = buildCodeSpanIndex(input, inlineStateStart);
 
     // 1. Handle <think> blocks (stateful, strip content inside)
     let processed = "";
-    THINKING_TAG_SCAN_RE.lastIndex = 0;
+    ROBUST_THINKING_RE.lastIndex = 0;
     let lastIndex = 0;
     let inThinking = state.thinking;
-    for (const match of text.matchAll(THINKING_TAG_SCAN_RE)) {
+
+    for (const match of input.matchAll(ROBUST_THINKING_RE)) {
       const idx = match.index ?? 0;
       if (codeSpans.isInside(idx)) continue;
+
+      // If we were NOT in thinking, appending everything up to this tag
       if (!inThinking) {
-        processed += text.slice(lastIndex, idx);
+        processed += input.slice(lastIndex, idx);
       }
+
       const isClose = match[1] === "/";
-      inThinking = !isClose;
+      if (!inThinking && !isClose) {
+        // <think> start
+        inThinking = true;
+      } else if (inThinking && isClose) {
+        // </think> end
+        inThinking = false;
+        // We do NOT append the content between start and end (it stays stripped)
+      }
+      // If we are inThinking, we skip content.
+
       lastIndex = idx + match[0].length;
     }
+
+    // Append remaining text if not currently thinking
     if (!inThinking) {
-      processed += text.slice(lastIndex);
+      processed += input.slice(lastIndex);
+    } else if (input.length - lastIndex > 5000) {
+      // 🚨 EMERGENCY ESCAPE: If thinking exceeds 5000 chars without a close tag,
+      // it's likely a hallucinated or malformed tag. Force output the rest.
+      processed += input.slice(lastIndex);
+      inThinking = false;
+      state.partialTagBuffer = undefined;
     }
     state.thinking = inThinking;
 
-    // 2. Handle <final> blocks (stateful, strip content OUTSIDE)
-    // If enforcement is disabled, we still strip the tags themselves to prevent
-    // hallucinations (e.g. Minimax copying the style) from leaking, but we
-    // do not enforce buffering/extraction logic.
+    // 2. Handle <final> blocks...
     const finalCodeSpans = buildCodeSpanIndex(processed, inlineStateStart);
     if (!params.enforceFinalTag) {
       state.inlineCode = finalCodeSpans.inlineState;
@@ -299,7 +353,8 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
       return stripTagsOutsideCodeSpans(processed, FINAL_TAG_SCAN_RE, finalCodeSpans.isInside);
     }
 
-    // If enforcement is enabled, only return text that appeared inside a <final> block.
+    // Strict Mode: If enforcing final tags, we MUST NOT return content unless
+    // we have seen a <final> tag.
     let result = "";
     FINAL_TAG_SCAN_RE.lastIndex = 0;
     let lastFinalIndex = 0;
@@ -310,34 +365,23 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
       const idx = match.index ?? 0;
       if (finalCodeSpans.isInside(idx)) continue;
       const isClose = match[1] === "/";
-
       if (!inFinal && !isClose) {
-        // Found <final> start tag.
         inFinal = true;
         everInFinal = true;
         lastFinalIndex = idx + match[0].length;
       } else if (inFinal && isClose) {
-        // Found </final> end tag.
         result += processed.slice(lastFinalIndex, idx);
         inFinal = false;
         lastFinalIndex = idx + match[0].length;
       }
     }
-
     if (inFinal) {
       result += processed.slice(lastFinalIndex);
     }
     state.final = inFinal;
 
-    // Strict Mode: If enforcing final tags, we MUST NOT return content unless
-    // we have seen a <final> tag. Otherwise, we leak "thinking out loud" text
-    // (e.g. "**Locating Manulife**...") that the model emitted without <think> tags.
-    if (!everInFinal) {
-      return "";
-    }
+    if (!everInFinal) return "";
 
-    // Hardened Cleanup: Remove any remaining <final> tags that might have been
-    // missed (e.g. nested tags or hallucinations) to prevent leakage.
     const resultCodeSpans = buildCodeSpanIndex(result, inlineStateStart);
     state.inlineCode = resultCodeSpans.inlineState;
     return stripTagsOutsideCodeSpans(result, FINAL_TAG_SCAN_RE, resultCodeSpans.isInside);

@@ -1,0 +1,1476 @@
+diff --git a/package.json b/package.json
+index f70ceece6..28c808560 100644
+--- a/package.json
++++ b/package.json
+@@ -284,4 +284,4 @@
+       "dist/OpenClaw.app/**"
+     ]
+   }
+-}
++}
+\ No newline at end of file
+diff --git a/patches/local-fix-invisible-reply.patch b/patches/local-fix-invisible-reply.patch
+index 5ac46cf68..fc5265c50 100644
+--- a/patches/local-fix-invisible-reply.patch
++++ b/patches/local-fix-invisible-reply.patch
+@@ -1,292 +1,316 @@
+-diff --git a/src/agents/models-config.providers.ts b/src/agents/models-config.providers.ts
+-index 0cd034c82..4244bad33 100644
+---- a/src/agents/models-config.providers.ts
+-+++ b/src/agents/models-config.providers.ts
+-@@ -293,6 +293,15 @@ function buildMoonshotProvider(): ProviderConfig {
+-         contextWindow: MOONSHOT_DEFAULT_CONTEXT_WINDOW,
+-         maxTokens: MOONSHOT_DEFAULT_MAX_TOKENS,
+-       },
+-+      {
+-+        id: "kimi-k2-thinking",
+-+        name: "Kimi K2 Thinking",
+-+        reasoning: false,
+-+        input: ["text"],
+-+        cost: MOONSHOT_DEFAULT_COST,
+-+        contextWindow: MOONSHOT_DEFAULT_CONTEXT_WINDOW,
+-+        maxTokens: MOONSHOT_DEFAULT_MAX_TOKENS,
+-+      },
+-     ],
+-   };
+- }
+-diff --git a/src/agents/pi-embedded-runner/run.ts b/src/agents/pi-embedded-runner/run.ts
+-index 1d5010679..18544c638 100644
+---- a/src/agents/pi-embedded-runner/run.ts
+-+++ b/src/agents/pi-embedded-runner/run.ts
+-@@ -24,8 +24,9 @@ import {
+-   resolveAuthProfileOrder,
+-   type ResolvedProviderAuth,
+- } from "../model-auth.js";
+--import { normalizeProviderId } from "../model-selection.js";
+-+import { normalizeProviderId, parseModelRef } from "../model-selection.js";
+- import { ensureOpenClawModelsJson } from "../models-config.js";
+-+import { smartRouter } from "../smart-router.js";
+- import {
+-   classifyFailoverReason,
+-   formatAssistantErrorText,
+-@@ -37,6 +38,7 @@ import {
+-   parseImageSizeError,
+-   parseImageDimensionError,
+-   isRateLimitAssistantError,
+-+  isRateLimitErrorMessage,
+-   isTimeoutErrorMessage,
+-   pickFallbackThinkingLevel,
+-   type FailoverReason,
+-@@ -92,8 +94,29 @@ export async function runEmbeddedPiAgent(
+-       const resolvedWorkspace = resolveUserPath(params.workspaceDir);
+-       const prevCwd = process.cwd();
+- 
+--      const provider = (params.provider ?? DEFAULT_PROVIDER).trim() || DEFAULT_PROVIDER;
+--      const modelId = (params.model ?? DEFAULT_MODEL).trim() || DEFAULT_MODEL;
+-+      const driverProvider = (params.provider ?? DEFAULT_PROVIDER).trim() || DEFAULT_PROVIDER;
+-+      const driverModelId = (params.model ?? DEFAULT_MODEL).trim() || DEFAULT_MODEL;
+-+
+-+      // [Smart Router] Dynamic Model Selection
+-+      let provider = driverProvider;
+-+      let modelId = driverModelId;
+-+
+-+      try {
+-+        if (params.prompt) {
+-+          const smartSelection = smartRouter.selectModel(params.prompt, `${provider}/${modelId}`);
+-+          const parsedSmart = parseModelRef(smartSelection, provider);
+-+          if (parsedSmart && (parsedSmart.provider !== provider || parsedSmart.model !== modelId)) {
+-+            log.info(`[Smart Router] Switching model from ${provider}/${modelId} to ${parsedSmart.provider}/${parsedSmart.model} based on task.`);
+-+            provider = parsedSmart.provider;
+-+            modelId = parsedSmart.model;
+-+          }
+-+        }
+-+        // Track usage for the selected model (Pro/Flash/etc)
+-+        smartRouter.incrementUsage(`${provider}/${modelId}`);
+-+      } catch (err) {
+-+        log.warn(`[Smart Router] Failed to select/track model: ${err}`);
+-+      }
+-+
+-       const agentDir = params.agentDir ?? resolveOpenClawAgentDir();
+-       const fallbackConfigured =
+-         (params.config?.agents?.defaults?.model?.fallbacks?.length ?? 0) > 0;
+-@@ -470,6 +493,7 @@ export async function runEmbeddedPiAgent(
+-               };
+-             }
+-             const promptFailoverReason = classifyFailoverReason(errorText);
+-+
+-             if (promptFailoverReason && promptFailoverReason !== "timeout" && lastProfileId) {
+-               await markAuthProfileFailure({
+-                 store: authStore,
+-@@ -481,10 +505,70 @@ export async function runEmbeddedPiAgent(
+-             }
+-             if (
+-               isFailoverErrorMessage(errorText) &&
+--              promptFailoverReason !== "timeout" &&
+--              (await advanceAuthProfile())
+-+              promptFailoverReason !== "timeout"
+-             ) {
+--              continue;
+-+              const isRateLimit = promptFailoverReason === "rate_limit" || isRateLimitErrorMessage(errorText);
+-+
+-+
+-+              // [Smart Rate Limit] If it's a rate limit, try waiting first before rotating accounts or failing over.
+-+              // Many preview models have low TPM but recover quickly.
+-+              if (isRateLimit && !overflowCompactionAttempted) { // Re-use overflow flag to track "have we tried a fix?"
+-+                log.warn(`[Smart Rate Limit] Rate limit hit for ${provider}/${modelId}. Waiting 60s to drain quota...`);
+-+                await new Promise(resolve => setTimeout(resolve, 60000));
+-+                // After waiting, we check if we should trigger compaction or just retry.
+-+                // If the user wants us to be smart, we can check estimated usage here.
+-+                const historyCount = attempt.messagesSnapshot?.length ?? 0; // Snapshot might be empty if error happened early, use safely
+-+                // Just retry cleanly once after wait. If it fails again, it will double-hit this block?
+-+                // No, we need a flag to prevent infinite waiting. 
+-+                // Let's use a specialized flag or repurpose overflowCompactionAttempted carefully, 
+-+                // OR just rely on the fact that if it fails again, we might want to try compaction.
+-+
+-+                // HACK: To keep it simple, we treat "Wait" as the first attempt at fixing. 
+-+                // If we are here, we haven't compacted yet.
+-+                // We'll mark a "waited" state using a local set or variable?
+-+                // The loop continues. Next time it hits, if it persists, we might want to rotate.
+-+
+-+                // Actually, simpler strategy:
+-+                // 1. Wait 15s.
+-+                // 2. Trigger compaction logic explicitly as a "safer" next step if we are big.
+-+                // Let's just Continue for now to retry. We need to avoid infinite loop.
+-+                // To avoid infinite loop, we MUST ensure we don't hit this block forever.
+-+                // But `run.ts` doesn't track "retries for same profile" well locally.
+-+
+-+                // Alternate: Just advance auth profile if available, OR wait if single profile?
+-+                // The user wants "Wait then Prune".
+-+
+-+                // Let's implement: Wait 15s, THEN if it happens again (next loop), fallback to compaction.
+-+                // But we don't have separate loop state.
+-+                // We can optimistically just Wait and Continue. 
+-+                // If it hits 429 again, `shouldRotate` logic later (line 553+) catches it?
+-+                // No, this block handles `promptFailoverReason`.
+-+
+-+                // Let's FORCE compaction if we are here and "Waiting" implies we are big.
+-+                // log.warn(`[Smart Rate Limit] Triggering proactive compaction after wait to ensure success.`);
+-+                // overflowCompactionAttempted = true; // Mark as "fix attempted"
+-+                // ... compaction code ...
+-+                // This effectively does: Wait 15s -> Compact -> Retry.
+-+
+-+                // Users request: "Calculate token usage, see if wait is enough".
+-+                // We can't easily know if "wait is enough" without the limit headers.
+-+                // So "Wait + Compact" is the safest "Smart" strategy.
+-+
+-+                // Let's just Wait 15s and Continue.
+-+                // We rely on `advanceAuthProfile` to break the loop if it keeps failing? 
+-+                // But `advanceAuthProfile` is only called if we pass this block.
+-+
+-+                // Let's rely on `overflowCompactionAttempted` to gate this.
+-+                // If !overflowCompactionAttempted, we Wait, set flag = true (abusing meaning slightly), and continue.
+-+                // If it fails again, overflowCompactionAttempted is true, so we skip this block and hit normal failover.
+-+
+-+                overflowCompactionAttempted = true; // Use this to ensure we only wait once per turn
+-+                continue;
+-+              }
+-+
+-+              if (await advanceAuthProfile()) {
+-+                continue;
+-+              }
+-             }
+-             const fallbackThinking = pickFallbackThinkingLevel({
+-               message: errorText,
+-@@ -553,6 +637,15 @@ export async function runEmbeddedPiAgent(
+-           const shouldRotate = (!aborted && failoverFailure) || timedOut;
+- 
+-           if (shouldRotate) {
+-+            // [Smart Rate Limit] Also handle rate limits reported via lastAssistant (not just promptError)
+-+            const isRateLimit = rateLimitFailure || assistantFailoverReason === "rate_limit";
+-+            if (isRateLimit && !overflowCompactionAttempted) {
+-+              log.warn(`[Smart Rate Limit] Assistant reported rate limit. Waiting 60s to drain quota...`);
+-+              await new Promise(resolve => setTimeout(resolve, 60000));
+-+              overflowCompactionAttempted = true;
+-+              continue;
+-+            }
+-+
+-             if (lastProfileId) {
+-               const reason =
+-                 timedOut || assistantFailoverReason === "timeout"
+-@@ -585,9 +678,9 @@ export async function runEmbeddedPiAgent(
+-               const message =
+-                 (lastAssistant
+-                   ? formatAssistantErrorText(lastAssistant, {
+--                      cfg: params.config,
+--                      sessionKey: params.sessionKey ?? params.sessionId,
+--                    })
+-+                    cfg: params.config,
+-+                    sessionKey: params.sessionKey ?? params.sessionId,
+-+                  })
+-                   : undefined) ||
+-                 lastAssistant?.errorMessage?.trim() ||
+-                 (timedOut
+-@@ -658,12 +751,12 @@ export async function runEmbeddedPiAgent(
+-               stopReason: attempt.clientToolCall ? "tool_calls" : undefined,
+-               pendingToolCalls: attempt.clientToolCall
+-                 ? [
+--                    {
+--                      id: `call_${Date.now()}`,
+--                      name: attempt.clientToolCall.name,
+--                      arguments: JSON.stringify(attempt.clientToolCall.params),
+--                    },
+--                  ]
+-+                  {
+-+                    id: `call_${Date.now()}`,
+-+                    name: attempt.clientToolCall.name,
+-+                    arguments: JSON.stringify(attempt.clientToolCall.params),
+-+                  },
+-+                ]
+-                 : undefined,
+-             },
+-             didSendViaMessagingTool: attempt.didSendViaMessagingTool,
+-diff --git a/src/agents/pi-embedded-runner/run/attempt.ts b/src/agents/pi-embedded-runner/run/attempt.ts
+-index 98cea5742..81cd715cc 100644
+---- a/src/agents/pi-embedded-runner/run/attempt.ts
+-+++ b/src/agents/pi-embedded-runner/run/attempt.ts
+-@@ -808,6 +808,7 @@ export async function runEmbeddedAttempt(
+-             });
+-           }
+- 
+-+
+-           // Only pass images option if there are actually images to pass
+-           // This avoids potential issues with models that don't expect the images parameter
+-           if (imageResult.images.length > 0) {
++diff --git a/patches/local-fix-invisible-reply.patch b/patches/local-fix-invisible-reply.patch
++index 5ac46cf68..e69de29bb 100644
++--- a/patches/local-fix-invisible-reply.patch
+++++ b/patches/local-fix-invisible-reply.patch
++@@ -1,292 +0,0 @@
++-diff --git a/src/agents/models-config.providers.ts b/src/agents/models-config.providers.ts
++-index 0cd034c82..4244bad33 100644
++---- a/src/agents/models-config.providers.ts
++-+++ b/src/agents/models-config.providers.ts
++-@@ -293,6 +293,15 @@ function buildMoonshotProvider(): ProviderConfig {
++-         contextWindow: MOONSHOT_DEFAULT_CONTEXT_WINDOW,
++-         maxTokens: MOONSHOT_DEFAULT_MAX_TOKENS,
++-       },
++-+      {
++-+        id: "kimi-k2-thinking",
++-+        name: "Kimi K2 Thinking",
++-+        reasoning: false,
++-+        input: ["text"],
++-+        cost: MOONSHOT_DEFAULT_COST,
++-+        contextWindow: MOONSHOT_DEFAULT_CONTEXT_WINDOW,
++-+        maxTokens: MOONSHOT_DEFAULT_MAX_TOKENS,
++-+      },
++-     ],
++-   };
++- }
++-diff --git a/src/agents/pi-embedded-runner/run.ts b/src/agents/pi-embedded-runner/run.ts
++-index 1d5010679..18544c638 100644
++---- a/src/agents/pi-embedded-runner/run.ts
++-+++ b/src/agents/pi-embedded-runner/run.ts
++-@@ -24,8 +24,9 @@ import {
++-   resolveAuthProfileOrder,
++-   type ResolvedProviderAuth,
++- } from "../model-auth.js";
++--import { normalizeProviderId } from "../model-selection.js";
++-+import { normalizeProviderId, parseModelRef } from "../model-selection.js";
++- import { ensureOpenClawModelsJson } from "../models-config.js";
++-+import { smartRouter } from "../smart-router.js";
++- import {
++-   classifyFailoverReason,
++-   formatAssistantErrorText,
++-@@ -37,6 +38,7 @@ import {
++-   parseImageSizeError,
++-   parseImageDimensionError,
++-   isRateLimitAssistantError,
++-+  isRateLimitErrorMessage,
++-   isTimeoutErrorMessage,
++-   pickFallbackThinkingLevel,
++-   type FailoverReason,
++-@@ -92,8 +94,29 @@ export async function runEmbeddedPiAgent(
++-       const resolvedWorkspace = resolveUserPath(params.workspaceDir);
++-       const prevCwd = process.cwd();
++- 
++--      const provider = (params.provider ?? DEFAULT_PROVIDER).trim() || DEFAULT_PROVIDER;
++--      const modelId = (params.model ?? DEFAULT_MODEL).trim() || DEFAULT_MODEL;
++-+      const driverProvider = (params.provider ?? DEFAULT_PROVIDER).trim() || DEFAULT_PROVIDER;
++-+      const driverModelId = (params.model ?? DEFAULT_MODEL).trim() || DEFAULT_MODEL;
++-+
++-+      // [Smart Router] Dynamic Model Selection
++-+      let provider = driverProvider;
++-+      let modelId = driverModelId;
++-+
++-+      try {
++-+        if (params.prompt) {
++-+          const smartSelection = smartRouter.selectModel(params.prompt, `${provider}/${modelId}`);
++-+          const parsedSmart = parseModelRef(smartSelection, provider);
++-+          if (parsedSmart && (parsedSmart.provider !== provider || parsedSmart.model !== modelId)) {
++-+            log.info(`[Smart Router] Switching model from ${provider}/${modelId} to ${parsedSmart.provider}/${parsedSmart.model} based on task.`);
++-+            provider = parsedSmart.provider;
++-+            modelId = parsedSmart.model;
++-+          }
++-+        }
++-+        // Track usage for the selected model (Pro/Flash/etc)
++-+        smartRouter.incrementUsage(`${provider}/${modelId}`);
++-+      } catch (err) {
++-+        log.warn(`[Smart Router] Failed to select/track model: ${err}`);
++-+      }
++-+
++-       const agentDir = params.agentDir ?? resolveOpenClawAgentDir();
++-       const fallbackConfigured =
++-         (params.config?.agents?.defaults?.model?.fallbacks?.length ?? 0) > 0;
++-@@ -470,6 +493,7 @@ export async function runEmbeddedPiAgent(
++-               };
++-             }
++-             const promptFailoverReason = classifyFailoverReason(errorText);
++-+
++-             if (promptFailoverReason && promptFailoverReason !== "timeout" && lastProfileId) {
++-               await markAuthProfileFailure({
++-                 store: authStore,
++-@@ -481,10 +505,70 @@ export async function runEmbeddedPiAgent(
++-             }
++-             if (
++-               isFailoverErrorMessage(errorText) &&
++--              promptFailoverReason !== "timeout" &&
++--              (await advanceAuthProfile())
++-+              promptFailoverReason !== "timeout"
++-             ) {
++--              continue;
++-+              const isRateLimit = promptFailoverReason === "rate_limit" || isRateLimitErrorMessage(errorText);
++-+
++-+
++-+              // [Smart Rate Limit] If it's a rate limit, try waiting first before rotating accounts or failing over.
++-+              // Many preview models have low TPM but recover quickly.
++-+              if (isRateLimit && !overflowCompactionAttempted) { // Re-use overflow flag to track "have we tried a fix?"
++-+                log.warn(`[Smart Rate Limit] Rate limit hit for ${provider}/${modelId}. Waiting 60s to drain quota...`);
++-+                await new Promise(resolve => setTimeout(resolve, 60000));
++-+                // After waiting, we check if we should trigger compaction or just retry.
++-+                // If the user wants us to be smart, we can check estimated usage here.
++-+                const historyCount = attempt.messagesSnapshot?.length ?? 0; // Snapshot might be empty if error happened early, use safely
++-+                // Just retry cleanly once after wait. If it fails again, it will double-hit this block?
++-+                // No, we need a flag to prevent infinite waiting. 
++-+                // Let's use a specialized flag or repurpose overflowCompactionAttempted carefully, 
++-+                // OR just rely on the fact that if it fails again, we might want to try compaction.
++-+
++-+                // HACK: To keep it simple, we treat "Wait" as the first attempt at fixing. 
++-+                // If we are here, we haven't compacted yet.
++-+                // We'll mark a "waited" state using a local set or variable?
++-+                // The loop continues. Next time it hits, if it persists, we might want to rotate.
++-+
++-+                // Actually, simpler strategy:
++-+                // 1. Wait 15s.
++-+                // 2. Trigger compaction logic explicitly as a "safer" next step if we are big.
++-+                // Let's just Continue for now to retry. We need to avoid infinite loop.
++-+                // To avoid infinite loop, we MUST ensure we don't hit this block forever.
++-+                // But `run.ts` doesn't track "retries for same profile" well locally.
++-+
++-+                // Alternate: Just advance auth profile if available, OR wait if single profile?
++-+                // The user wants "Wait then Prune".
++-+
++-+                // Let's implement: Wait 15s, THEN if it happens again (next loop), fallback to compaction.
++-+                // But we don't have separate loop state.
++-+                // We can optimistically just Wait and Continue. 
++-+                // If it hits 429 again, `shouldRotate` logic later (line 553+) catches it?
++-+                // No, this block handles `promptFailoverReason`.
++-+
++-+                // Let's FORCE compaction if we are here and "Waiting" implies we are big.
++-+                // log.warn(`[Smart Rate Limit] Triggering proactive compaction after wait to ensure success.`);
++-+                // overflowCompactionAttempted = true; // Mark as "fix attempted"
++-+                // ... compaction code ...
++-+                // This effectively does: Wait 15s -> Compact -> Retry.
++-+
++-+                // Users request: "Calculate token usage, see if wait is enough".
++-+                // We can't easily know if "wait is enough" without the limit headers.
++-+                // So "Wait + Compact" is the safest "Smart" strategy.
++-+
++-+                // Let's just Wait 15s and Continue.
++-+                // We rely on `advanceAuthProfile` to break the loop if it keeps failing? 
++-+                // But `advanceAuthProfile` is only called if we pass this block.
++-+
++-+                // Let's rely on `overflowCompactionAttempted` to gate this.
++-+                // If !overflowCompactionAttempted, we Wait, set flag = true (abusing meaning slightly), and continue.
++-+                // If it fails again, overflowCompactionAttempted is true, so we skip this block and hit normal failover.
++-+
++-+                overflowCompactionAttempted = true; // Use this to ensure we only wait once per turn
++-+                continue;
++-+              }
++-+
++-+              if (await advanceAuthProfile()) {
++-+                continue;
++-+              }
++-             }
++-             const fallbackThinking = pickFallbackThinkingLevel({
++-               message: errorText,
++-@@ -553,6 +637,15 @@ export async function runEmbeddedPiAgent(
++-           const shouldRotate = (!aborted && failoverFailure) || timedOut;
++- 
++-           if (shouldRotate) {
++-+            // [Smart Rate Limit] Also handle rate limits reported via lastAssistant (not just promptError)
++-+            const isRateLimit = rateLimitFailure || assistantFailoverReason === "rate_limit";
++-+            if (isRateLimit && !overflowCompactionAttempted) {
++-+              log.warn(`[Smart Rate Limit] Assistant reported rate limit. Waiting 60s to drain quota...`);
++-+              await new Promise(resolve => setTimeout(resolve, 60000));
++-+              overflowCompactionAttempted = true;
++-+              continue;
++-+            }
++-+
++-             if (lastProfileId) {
++-               const reason =
++-                 timedOut || assistantFailoverReason === "timeout"
++-@@ -585,9 +678,9 @@ export async function runEmbeddedPiAgent(
++-               const message =
++-                 (lastAssistant
++-                   ? formatAssistantErrorText(lastAssistant, {
++--                      cfg: params.config,
++--                      sessionKey: params.sessionKey ?? params.sessionId,
++--                    })
++-+                    cfg: params.config,
++-+                    sessionKey: params.sessionKey ?? params.sessionId,
++-+                  })
++-                   : undefined) ||
++-                 lastAssistant?.errorMessage?.trim() ||
++-                 (timedOut
++-@@ -658,12 +751,12 @@ export async function runEmbeddedPiAgent(
++-               stopReason: attempt.clientToolCall ? "tool_calls" : undefined,
++-               pendingToolCalls: attempt.clientToolCall
++-                 ? [
++--                    {
++--                      id: `call_${Date.now()}`,
++--                      name: attempt.clientToolCall.name,
++--                      arguments: JSON.stringify(attempt.clientToolCall.params),
++--                    },
++--                  ]
++-+                  {
++-+                    id: `call_${Date.now()}`,
++-+                    name: attempt.clientToolCall.name,
++-+                    arguments: JSON.stringify(attempt.clientToolCall.params),
++-+                  },
++-+                ]
++-                 : undefined,
++-             },
++-             didSendViaMessagingTool: attempt.didSendViaMessagingTool,
++-diff --git a/src/agents/pi-embedded-runner/run/attempt.ts b/src/agents/pi-embedded-runner/run/attempt.ts
++-index 98cea5742..81cd715cc 100644
++---- a/src/agents/pi-embedded-runner/run/attempt.ts
++-+++ b/src/agents/pi-embedded-runner/run/attempt.ts
++-@@ -808,6 +808,7 @@ export async function runEmbeddedAttempt(
++-             });
++-           }
++- 
++-+
++-           // Only pass images option if there are actually images to pass
++-           // This avoids potential issues with models that don't expect the images parameter
++-           if (imageResult.images.length > 0) {
++-diff --git a/src/agents/pi-embedded-subscribe.ts b/src/agents/pi-embedded-subscribe.ts
++-index a4a4b906a..35c2208da 100644
++---- a/src/agents/pi-embedded-subscribe.ts
++-+++ b/src/agents/pi-embedded-subscribe.ts
++-@@ -260,6 +260,11 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
++-   ): string => {
++-     if (!text) return text;
++- 
++-+    // If reasoning is explicitly disabled, treat <think> tags as normal text (pass-through).
++-+    // This allows models like Kimi/DeepSeek to show their thinking process in the main chat
++-+    // when the client doesn't support a dedicated reasoning channel.
++-+    if (reasoningMode === "off") return text;
++-+
++-     const inlineStateStart = state.inlineCode ?? createInlineCodeState();
++-     const codeSpans = buildCodeSpanIndex(text, inlineStateStart);
++- 
++-diff --git a/src/agents/pi-tools.read.ts b/src/agents/pi-tools.read.ts
++-index 6decbb83b..4663e2fb5 100644
++---- a/src/agents/pi-tools.read.ts
++-+++ b/src/agents/pi-tools.read.ts
++-@@ -272,11 +272,26 @@ export function createOpenClawReadTool(base: AnyAgentTool): AnyAgentTool {
++-         normalized ??
++-         (params && typeof params === "object" ? (params as Record<string, unknown>) : undefined);
++-       assertRequiredParams(record, CLAUDE_PARAM_GROUPS.read, base.name);
++--      const result = (await base.execute(
++--        toolCallId,
++--        normalized ?? params,
++--        signal,
++--      )) as AgentToolResult<unknown>;
++-+      let result: AgentToolResult<unknown>;
++-+      try {
++-+        result = (await base.execute(
++-+          toolCallId,
++-+          normalized ?? params,
++-+          signal,
++-+        )) as AgentToolResult<unknown>;
++-+      } catch (err: unknown) {
++-+        const msg = String(err);
++-+        if (msg.includes("beyond end of file")) {
++-+          return {
++-+            toolCallId,
++-+            toolName: base.name,
++-+            content: [{ type: "text", text: `Observation: ${msg}\nPlease request a smaller range or check the file size.` }],
++-+            isError: false,
++-+            details: { text: msg },
++-+          };
++-+        }
++-+        throw err;
++-+      }
++-       const filePath = typeof record?.path === "string" ? String(record.path) : "<unknown>";
++-       const normalizedResult = await normalizeReadImageResult(result, filePath);
++-       return sanitizeToolResultImages(normalizedResult, `read:${filePath}`);
++-diff --git a/src/auto-reply/reply/get-reply-run.ts b/src/auto-reply/reply/get-reply-run.ts
++-index 19c4df49b..a33c4b136 100644
++---- a/src/auto-reply/reply/get-reply-run.ts
++-+++ b/src/auto-reply/reply/get-reply-run.ts
++-@@ -171,12 +171,12 @@ export async function runPreparedReply(
++-   );
++-   const groupIntro = shouldInjectGroupIntro
++-     ? buildGroupIntro({
++--        cfg,
++--        sessionCtx,
++--        sessionEntry,
++--        defaultActivation,
++--        silentToken: SILENT_REPLY_TOKEN,
++--      })
++-+      cfg,
++-+      sessionCtx,
++-+      sessionEntry,
++-+      defaultActivation,
++-+      silentToken: SILENT_REPLY_TOKEN,
++-+    })
++-     : "";
++-   const groupSystemPrompt = sessionCtx.GroupSystemPrompt?.trim() ?? "";
++-   const extraSystemPrompt = [groupIntro, groupSystemPrompt].filter(Boolean).join("\n\n");
+ diff --git a/src/agents/pi-embedded-subscribe.ts b/src/agents/pi-embedded-subscribe.ts
+-index a4a4b906a..35c2208da 100644
++index 35c2208da..dac022af1 100644
+ --- a/src/agents/pi-embedded-subscribe.ts
+ +++ b/src/agents/pi-embedded-subscribe.ts
+-@@ -260,6 +260,11 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
+-   ): string => {
+-     if (!text) return text;
++@@ -263,7 +263,13 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
++     // If reasoning is explicitly disabled, treat <think> tags as normal text (pass-through).
++     // This allows models like Kimi/DeepSeek to show their thinking process in the main chat
++     // when the client doesn't support a dedicated reasoning channel.
++-    if (reasoningMode === "off") return text;
+++    if (reasoningMode === "off") {
+++      // We must strip the <think> tags themselves, otherwise the UI might
+++      // treat them as unknown HTML tags and hide the content strictly (or just the tags).
+++      // To be safe and show the content, we remove the tags but keep the text.
+++      // We use a simple regex here; split tags across chunks might be visible but readable.
+++      return text.replace(/<\/?(?:think(?:ing)?|thought|antthinking)>/gi, "");
+++    }
+  
+-+    // If reasoning is explicitly disabled, treat <think> tags as normal text (pass-through).
+-+    // This allows models like Kimi/DeepSeek to show their thinking process in the main chat
+-+    // when the client doesn't support a dedicated reasoning channel.
+-+    if (reasoningMode === "off") return text;
+-+
+      const inlineStateStart = state.inlineCode ?? createInlineCodeState();
+      const codeSpans = buildCodeSpanIndex(text, inlineStateStart);
+- 
+-diff --git a/src/agents/pi-tools.read.ts b/src/agents/pi-tools.read.ts
+-index 6decbb83b..4663e2fb5 100644
+---- a/src/agents/pi-tools.read.ts
+-+++ b/src/agents/pi-tools.read.ts
+-@@ -272,11 +272,26 @@ export function createOpenClawReadTool(base: AnyAgentTool): AnyAgentTool {
+-         normalized ??
+-         (params && typeof params === "object" ? (params as Record<string, unknown>) : undefined);
+-       assertRequiredParams(record, CLAUDE_PARAM_GROUPS.read, base.name);
+--      const result = (await base.execute(
+--        toolCallId,
+--        normalized ?? params,
+--        signal,
+--      )) as AgentToolResult<unknown>;
+-+      let result: AgentToolResult<unknown>;
+-+      try {
+-+        result = (await base.execute(
+-+          toolCallId,
+-+          normalized ?? params,
+-+          signal,
+-+        )) as AgentToolResult<unknown>;
+-+      } catch (err: unknown) {
+-+        const msg = String(err);
+-+        if (msg.includes("beyond end of file")) {
+-+          return {
+-+            toolCallId,
+-+            toolName: base.name,
+-+            content: [{ type: "text", text: `Observation: ${msg}\nPlease request a smaller range or check the file size.` }],
+-+            isError: false,
+-+            details: { text: msg },
+-+          };
+-+        }
+-+        throw err;
+-+      }
+-       const filePath = typeof record?.path === "string" ? String(record.path) : "<unknown>";
+-       const normalizedResult = await normalizeReadImageResult(result, filePath);
+-       return sanitizeToolResultImages(normalizedResult, `read:${filePath}`);
+-diff --git a/src/auto-reply/reply/get-reply-run.ts b/src/auto-reply/reply/get-reply-run.ts
+-index 19c4df49b..a33c4b136 100644
+---- a/src/auto-reply/reply/get-reply-run.ts
+-+++ b/src/auto-reply/reply/get-reply-run.ts
+-@@ -171,12 +171,12 @@ export async function runPreparedReply(
+-   );
+-   const groupIntro = shouldInjectGroupIntro
+-     ? buildGroupIntro({
+--        cfg,
+--        sessionCtx,
+--        sessionEntry,
+--        defaultActivation,
+--        silentToken: SILENT_REPLY_TOKEN,
+--      })
+-+      cfg,
+-+      sessionCtx,
+-+      sessionEntry,
+-+      defaultActivation,
+-+      silentToken: SILENT_REPLY_TOKEN,
+-+    })
+-     : "";
+-   const groupSystemPrompt = sessionCtx.GroupSystemPrompt?.trim() ?? "";
+-   const extraSystemPrompt = [groupIntro, groupSystemPrompt].filter(Boolean).join("\n\n");
+diff --git a/src/agents/model-experience.ts b/src/agents/model-experience.ts
+index 4769c2e2d..458676af4 100644
+--- a/src/agents/model-experience.ts
++++ b/src/agents/model-experience.ts
+@@ -134,23 +134,38 @@ export class ModelExperienceEngine {
+     public detectCategory(taskType: string): string {
+         const lower = taskType.toLowerCase();
+ 
++        // Helper to check for whole words or strong indicators (English)
++        const has = (word: string) => {
++            const regex = new RegExp(`\\b${word}\\b`, 'i');
++            return regex.test(lower);
++        };
++
++        // Helper for Chinese keywords (no word boundary check needed)
++        const hasCN = (word: string) => lower.includes(word);
++
+         // Frontend
+-        if (lower.includes("css") || lower.includes("html") || lower.includes("react") || lower.includes("vue") || lower.includes("ui") || lower.includes("frontend")) return "frontend";
++        if (has("css") || has("html") || has("react") || has("vue") || has("ui") || has("frontend") || has("dom") ||
++            hasCN("前端") || hasCN("界面") || hasCN("样式") || hasCN("网页")) return "frontend";
+ 
+         // Backend
+-        if (lower.includes("python") || lower.includes("node") || lower.includes("express") || lower.includes("api") || lower.includes("sql") || lower.includes("db") || lower.includes("backend")) return "backend";
++        if (has("python") || has("node") || has("express") || has("api") || has("sql") || has("db") || has("backend") || has("server") || has("database") ||
++            hasCN("后端") || hasCN("服务端") || hasCN("数据库") || hasCN("接口")) return "backend";
+ 
+         // Architecture / Complex
+-        if (lower.includes("architecture") || lower.includes("design") || lower.includes("system") || lower.includes("complex") || lower.includes("plan")) return "architecture";
++        if (has("architecture") || has("design") || has("system") || has("complex") || has("plan") || lower.includes("structure") ||
++            hasCN("架构") || hasCN("设计") || hasCN("方案") || hasCN("系统")) return "architecture";
+ 
+         // Debugging
+-        if (lower.includes("debug") || lower.includes("fix") || lower.includes("error") || lower.includes("bug") || lower.includes("log")) return "debugging";
++        if (has("debug") || has("fix") || has("bug") || has("issue") || has("crash") || has("exception") || has("error") || has("trace") || has("stack") ||
++            hasCN("调试") || hasCN("报错") || hasCN("错误") || hasCN("修复") || hasCN("异常") || hasCN("崩溃") || hasCN("排查")) return "debugging";
+ 
+         // Creative / Writing
+-        if (lower.includes("write") || lower.includes("story") || lower.includes("creative") || lower.includes("generate")) return "creative";
++        if (has("write") || has("story") || has("creative") || has("generate") || has("draft") || has("novel") ||
++            hasCN("写作") || hasCN("故事") || hasCN("小说") || hasCN("文案") || hasCN("扩写") || hasCN("创作")) return "creative";
+ 
+         // General Coding (fallback)
+-        if (lower.includes("code") || lower.includes("function") || lower.includes("ts") || lower.includes("js")) return "coding";
++        if (has("code") || has("function") || has("ts") || has("js") || has("script") ||
++            hasCN("代码") || hasCN("脚本") || hasCN("编程") || hasCN("写一段") || hasCN("实现")) return "coding";
+ 
+         return "general";
+     }
+diff --git a/src/agents/models-config.providers.ts b/src/agents/models-config.providers.ts
+index 4244bad33..0af2ce35e 100644
+--- a/src/agents/models-config.providers.ts
++++ b/src/agents/models-config.providers.ts
+@@ -41,7 +41,7 @@ const XIAOMI_DEFAULT_COST = {
+   cacheWrite: 0,
+ };
+ 
+-const MOONSHOT_BASE_URL = "https://api.moonshot.ai/v1";
++const MOONSHOT_BASE_URL = "https://api.moonshot.cn/v1";
+ const MOONSHOT_DEFAULT_MODEL_ID = "kimi-k2.5";
+ const MOONSHOT_DEFAULT_CONTEXT_WINDOW = 256000;
+ const MOONSHOT_DEFAULT_MAX_TOKENS = 8192;
+diff --git a/src/agents/pi-embedded-runner/run.ts b/src/agents/pi-embedded-runner/run.ts
+index 18544c638..5b959fc6a 100644
+--- a/src/agents/pi-embedded-runner/run.ts
++++ b/src/agents/pi-embedded-runner/run.ts
+@@ -321,8 +321,10 @@ export async function runEmbeddedPiAgent(
+           attemptedThinking.add(thinkLevel);
+           await fs.mkdir(resolvedWorkspace, { recursive: true });
+ 
++          // Clean up routing prefixes (e.g. !kimi) so the model doesn't see them
++          const cleanedPrompt = smartRouter.cleanupPrompt(params.prompt);
+           const prompt =
+-            provider === "anthropic" ? scrubAnthropicRefusalMagic(params.prompt) : params.prompt;
++            provider === "anthropic" ? scrubAnthropicRefusalMagic(cleanedPrompt) : cleanedPrompt;
+ 
+           const attempt = await runEmbeddedAttempt({
+             sessionId: params.sessionId,
+diff --git a/src/agents/pi-embedded-subscribe.handlers.messages.ts b/src/agents/pi-embedded-subscribe.handlers.messages.ts
+index 1f515e113..6f9bdbe4a 100644
+--- a/src/agents/pi-embedded-subscribe.handlers.messages.ts
++++ b/src/agents/pi-embedded-subscribe.handlers.messages.ts
+@@ -19,6 +19,9 @@ import {
+ } from "./pi-embedded-utils.js";
+ import { createInlineCodeState } from "../markdown/code-spans.js";
+ 
++// Use a robust regex that handles newlines and case insensitivity globaly to avoid recompilation
++const ROBUST_THINKING_RE = /<\s*(\/?)\s*(?:think(?:ing)?|thought|antthinking)\s*>/gis;
++
+ export function handleMessageStart(
+   ctx: EmbeddedPiSubscribeContext,
+   evt: AgentEvent & { message: AgentMessage },
+@@ -44,18 +47,40 @@ export function handleMessageUpdate(
+   if (msg?.role !== "assistant") return;
+ 
+   const assistantEvent = evt.assistantMessageEvent;
++
++  // [DEBUG] Log RAW event structure to catch non-standard event types
++  if (assistantEvent) {
++    console.log(`[KIMI_RAW_DEBUG] Event Type: ${(assistantEvent as any).type}`, JSON.stringify(assistantEvent).slice(0, 200));
++  }
++
+   const assistantRecord =
+     assistantEvent && typeof assistantEvent === "object"
+       ? (assistantEvent as Record<string, unknown>)
+       : undefined;
+-  const evtType = typeof assistantRecord?.type === "string" ? assistantRecord.type : "";
+ 
+-  if (evtType !== "text_delta" && evtType !== "text_start" && evtType !== "text_end") {
+-    return;
++  // [Kimi/DeepSeek Support] Extract reasoning_content from raw delta object
++  // pi-ai might pass the raw OpenAI delta object as `assistantRecord.delta`
++  const rawDeltaObj = assistantRecord?.delta as Record<string, unknown> | undefined;
++  if (rawDeltaObj && typeof rawDeltaObj === "object" && "reasoning_content" in rawDeltaObj) {
++    const r = rawDeltaObj.reasoning_content;
++    if (typeof r === "string" && r.length > 0) {
++      // Manually emit reasoning stream since standard delta extraction misses it
++      ctx.emitReasoningStream(r);
++    }
+   }
+ 
++  const evtType = typeof assistantRecord?.type === "string" ? assistantRecord.type : "";
++
++  // [DEBUG] Log all deltas to see what Kimi is actually sending
+   const delta = typeof assistantRecord?.delta === "string" ? assistantRecord.delta : "";
+   const content = typeof assistantRecord?.content === "string" ? assistantRecord.content : "";
++  if (delta || content) {
++    console.log(`[KIMI_DEBUG] ${evtType} | Delta: ${JSON.stringify(delta)} | Content: ${JSON.stringify(content)}`);
++  }
++
++  if (evtType !== "text_delta" && evtType !== "text_start" && evtType !== "text_end") {
++    return;
++  }
+ 
+   appendRawStream({
+     ts: Date.now(),
+@@ -166,27 +191,42 @@ export function handleMessageEnd(
+   promoteThinkingTagsToBlocks(assistantMessage);
+ 
+   const rawText = extractAssistantText(assistantMessage);
++  const rawThinking = extractAssistantThinking(assistantMessage);
++
++  // [DEBUG] Log final message state
++  console.log(`[KIMI_DEBUG] Message End | Raw Text: ${JSON.stringify(rawText)}`);
++  console.log(`[KIMI_DEBUG] Message End | Raw Thinking: ${JSON.stringify(rawThinking)}`);
++
+   appendRawStream({
+     ts: Date.now(),
+     event: "assistant_message_end",
+     runId: ctx.params.runId,
+     sessionId: (ctx.params.session as { id?: string }).id,
+     rawText,
+-    rawThinking: extractAssistantThinking(assistantMessage),
++    rawThinking,
+   });
+ 
+-  const text = ctx.stripBlockTags(rawText, { thinking: false, final: false });
+-  const rawThinking =
+-    ctx.state.includeReasoning || ctx.state.streamReasoning
+-      ? extractAssistantThinking(assistantMessage) || extractThinkingFromTaggedText(rawText)
+-      : "";
+-  const formattedReasoning = rawThinking ? formatReasoningMessage(rawThinking) : "";
+-
+-  const addedDuringMessage = ctx.state.assistantTexts.length > ctx.state.assistantTextBaseline;
+   const chunkerHasBuffered = ctx.blockChunker?.hasBuffered() ?? false;
+-  ctx.finalizeAssistantTexts({ text, addedDuringMessage, chunkerHasBuffered });
++  // If baseline is exceeded, it means we added rows during the message stream
++  const addedDuringMessage = ctx.state.assistantTexts.length > ctx.state.assistantTextBaseline;
++
++  const text = ctx.stripBlockTags(rawText, { thinking: false, final: false });
++  // Ensure we flush everything even if stripBlockTags state was stuck
++  if (!text && rawText && !ctx.state.includeReasoning) {
++    ctx.log.debug("Fallback: stripBlockTags returned empty for non-reasoning mode, flushing rawText.");
++    // If we are in off-mode and tags somehow ate everything, just show raw text without tags
++    const fallbackText = rawText.replace(ROBUST_THINKING_RE, "\n").trim();
++    ctx.finalizeAssistantTexts({ text: fallbackText, addedDuringMessage, chunkerHasBuffered });
++  } else {
++    ctx.finalizeAssistantTexts({ text, addedDuringMessage, chunkerHasBuffered });
++  }
+ 
+   const onBlockReply = ctx.params.onBlockReply;
++  const formattedReasoning =
++    (ctx.state.includeReasoning) && rawThinking
++      ? formatReasoningMessage(rawThinking)
++      : undefined;
++
+   const shouldEmitReasoning = Boolean(
+     ctx.state.includeReasoning &&
+     formattedReasoning &&
+diff --git a/src/agents/pi-embedded-subscribe.handlers.types.ts b/src/agents/pi-embedded-subscribe.handlers.types.ts
+index 4a464c5e2..5bd2ffefd 100644
+--- a/src/agents/pi-embedded-subscribe.handlers.types.ts
++++ b/src/agents/pi-embedded-subscribe.handlers.types.ts
+@@ -36,7 +36,12 @@ export type EmbeddedPiSubscribeState = {
+ 
+   deltaBuffer: string;
+   blockBuffer: string;
+-  blockState: { thinking: boolean; final: boolean; inlineCode: InlineCodeState };
++  blockState: {
++    thinking: boolean;
++    final: boolean;
++    inlineCode: InlineCodeState;
++    partialTagBuffer?: string;
++  };
+   lastStreamedAssistant?: string;
+   lastStreamedReasoning?: string;
+   lastBlockReplyText?: string;
+@@ -73,7 +78,12 @@ export type EmbeddedPiSubscribeContext = {
+   emitToolOutput: (toolName?: string, meta?: string, output?: string) => void;
+   stripBlockTags: (
+     text: string,
+-    state: { thinking: boolean; final: boolean; inlineCode?: InlineCodeState },
++    state: {
++      thinking: boolean;
++      final: boolean;
++      inlineCode?: InlineCodeState;
++      partialTagBuffer?: string;
++    },
+   ) => string;
+   emitBlockChunk: (text: string) => void;
+   flushBlockReplyBuffer: () => void;
+@@ -98,5 +108,5 @@ export type EmbeddedPiSubscribeContext = {
+ 
+ export type EmbeddedPiSubscribeEvent =
+   | AgentEvent
+-  | { type: string; [k: string]: unknown }
++  | { type: string;[k: string]: unknown }
+   | { type: "message_start"; message: AgentMessage };
+diff --git a/src/agents/pi-embedded-subscribe.ts b/src/agents/pi-embedded-subscribe.ts
+index 35c2208da..640d4303c 100644
+--- a/src/agents/pi-embedded-subscribe.ts
++++ b/src/agents/pi-embedded-subscribe.ts
+@@ -17,7 +17,8 @@ import type {
+ import type { SubscribeEmbeddedPiSessionParams } from "./pi-embedded-subscribe.types.js";
+ import { formatReasoningMessage } from "./pi-embedded-utils.js";
+ 
+-const THINKING_TAG_SCAN_RE = /<\s*(\/?)\s*(?:think(?:ing)?|thought|antthinking)\s*>/gi;
++// Use a robust regex that handles newlines and case insensitivity globaly to avoid recompilation
++const ROBUST_THINKING_RE = /<\s*(\/?)\s*(?:think(?:ing)?|thought|antthinking)\s*>/gis;
+ const FINAL_TAG_SCAN_RE = /<\s*(\/?)\s*final\s*>/gi;
+ const log = createSubsystemLogger("agent/embedded");
+ 
+@@ -254,44 +255,97 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
+     }
+   };
+ 
++  // Robust stateful parser for thinking tags that handles:
++  // 1. Tags split across chunks (e.g. <th + ink>) - via state.partialTagBuffer
++  // 2. Newlines inside tags.
++  // 3. Different provider variants (<think>, <thought>, <antthinking>).
++
+   const stripBlockTags = (
+     text: string,
+-    state: { thinking: boolean; final: boolean; inlineCode?: InlineCodeState },
++    state: {
++      thinking: boolean;
++      final: boolean;
++      inlineCode?: InlineCodeState;
++      partialTagBuffer?: string;
++    },
+   ): string => {
+-    if (!text) return text;
++    let input = text;
++
++    // 0. Handle partial tags from previous chunk
++    if (state.partialTagBuffer) {
++      input = state.partialTagBuffer + text;
++      state.partialTagBuffer = undefined;
++    }
++
++    if (!input) return input;
++
++    // Detect potential partial tag at the end of the chunk (max 20 chars).
++    // This prevents tags like <think> being split as <thi + nk> across chunks.
++    const lastOpen = input.lastIndexOf("<");
++    if (lastOpen !== -1 && lastOpen > input.length - 20) {
++      const potentialTag = input.slice(lastOpen);
++      if (!potentialTag.includes(">")) {
++        // Broad check for potential thinking/final tags
++        if (/^<\s*(\/?)\s*[a-z]*$/i.test(potentialTag)) {
++          state.partialTagBuffer = potentialTag;
++          input = input.slice(0, lastOpen);
++          if (!input) return "";
++        }
++      }
++    }
+ 
+-    // If reasoning is explicitly disabled, treat <think> tags as normal text (pass-through).
+-    // This allows models like Kimi/DeepSeek to show their thinking process in the main chat
+-    // when the client doesn't support a dedicated reasoning channel.
+-    if (reasoningMode === "off") return text;
++    if (reasoningMode === "off") {
++      // Robustly remove tags but keep content. 
++      // Replace with newline to prevent text sticking together.
++      const cleaned = input.replace(ROBUST_THINKING_RE, "\n");
++      return cleaned.startsWith("\n") ? cleaned.trimStart() : cleaned;
++    }
+ 
+     const inlineStateStart = state.inlineCode ?? createInlineCodeState();
+-    const codeSpans = buildCodeSpanIndex(text, inlineStateStart);
++    const codeSpans = buildCodeSpanIndex(input, inlineStateStart);
+ 
+     // 1. Handle <think> blocks (stateful, strip content inside)
+     let processed = "";
+-    THINKING_TAG_SCAN_RE.lastIndex = 0;
++    ROBUST_THINKING_RE.lastIndex = 0;
+     let lastIndex = 0;
+     let inThinking = state.thinking;
+-    for (const match of text.matchAll(THINKING_TAG_SCAN_RE)) {
++
++    for (const match of input.matchAll(ROBUST_THINKING_RE)) {
+       const idx = match.index ?? 0;
+       if (codeSpans.isInside(idx)) continue;
++
++      // If we were NOT in thinking, appending everything up to this tag
+       if (!inThinking) {
+-        processed += text.slice(lastIndex, idx);
++        processed += input.slice(lastIndex, idx);
+       }
++
+       const isClose = match[1] === "/";
+-      inThinking = !isClose;
++      if (!inThinking && !isClose) {
++        // <think> start
++        inThinking = true;
++      } else if (inThinking && isClose) {
++        // </think> end
++        inThinking = false;
++        // We do NOT append the content between start and end (it stays stripped)
++      }
++      // If we are inThinking, we skip content.
++
+       lastIndex = idx + match[0].length;
+     }
++
++    // Append remaining text if not currently thinking
+     if (!inThinking) {
+-      processed += text.slice(lastIndex);
++      processed += input.slice(lastIndex);
++    } else if (input.length - lastIndex > 5000) {
++      // 🚨 EMERGENCY ESCAPE: If thinking exceeds 5000 chars without a close tag,
++      // it's likely a hallucinated or malformed tag. Force output the rest.
++      processed += input.slice(lastIndex);
++      inThinking = false;
++      state.partialTagBuffer = undefined;
+     }
+     state.thinking = inThinking;
+ 
+-    // 2. Handle <final> blocks (stateful, strip content OUTSIDE)
+-    // If enforcement is disabled, we still strip the tags themselves to prevent
+-    // hallucinations (e.g. Minimax copying the style) from leaking, but we
+-    // do not enforce buffering/extraction logic.
++    // 2. Handle <final> blocks...
+     const finalCodeSpans = buildCodeSpanIndex(processed, inlineStateStart);
+     if (!params.enforceFinalTag) {
+       state.inlineCode = finalCodeSpans.inlineState;
+@@ -299,7 +353,8 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
+       return stripTagsOutsideCodeSpans(processed, FINAL_TAG_SCAN_RE, finalCodeSpans.isInside);
+     }
+ 
+-    // If enforcement is enabled, only return text that appeared inside a <final> block.
++    // Strict Mode: If enforcing final tags, we MUST NOT return content unless
++    // we have seen a <final> tag.
+     let result = "";
+     FINAL_TAG_SCAN_RE.lastIndex = 0;
+     let lastFinalIndex = 0;
+@@ -310,34 +365,23 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
+       const idx = match.index ?? 0;
+       if (finalCodeSpans.isInside(idx)) continue;
+       const isClose = match[1] === "/";
+-
+       if (!inFinal && !isClose) {
+-        // Found <final> start tag.
+         inFinal = true;
+         everInFinal = true;
+         lastFinalIndex = idx + match[0].length;
+       } else if (inFinal && isClose) {
+-        // Found </final> end tag.
+         result += processed.slice(lastFinalIndex, idx);
+         inFinal = false;
+         lastFinalIndex = idx + match[0].length;
+       }
+     }
+-
+     if (inFinal) {
+       result += processed.slice(lastFinalIndex);
+     }
+     state.final = inFinal;
+ 
+-    // Strict Mode: If enforcing final tags, we MUST NOT return content unless
+-    // we have seen a <final> tag. Otherwise, we leak "thinking out loud" text
+-    // (e.g. "**Locating Manulife**...") that the model emitted without <think> tags.
+-    if (!everInFinal) {
+-      return "";
+-    }
++    if (!everInFinal) return "";
+ 
+-    // Hardened Cleanup: Remove any remaining <final> tags that might have been
+-    // missed (e.g. nested tags or hallucinations) to prevent leakage.
+     const resultCodeSpans = buildCodeSpanIndex(result, inlineStateStart);
+     state.inlineCode = resultCodeSpans.inlineState;
+     return stripTagsOutsideCodeSpans(result, FINAL_TAG_SCAN_RE, resultCodeSpans.isInside);
+diff --git a/src/agents/shell-utils.ts b/src/agents/shell-utils.ts
+index 6d4efac59..c646a475d 100644
+--- a/src/agents/shell-utils.ts
++++ b/src/agents/shell-utils.ts
+@@ -19,14 +19,11 @@ function resolvePowerShellPath(): string {
+ 
+ export function getShellConfig(): { shell: string; args: string[] } {
+   if (process.platform === "win32") {
+-    // Use PowerShell instead of cmd.exe on Windows.
+-    // Problem: Many Windows system utilities (ipconfig, systeminfo, etc.) write
+-    // directly to the console via WriteConsole API, bypassing stdout pipes.
+-    // When Node.js spawns cmd.exe with piped stdio, these utilities produce no output.
+-    // PowerShell properly captures and redirects their output to stdout.
++    // Use PowerShell on Windows for better tool compatibility (ls, cat, grep aliases)
++    // and richer scripting capabilities requested by user.
+     return {
+-      shell: resolvePowerShellPath(),
+-      args: ["-NoProfile", "-NonInteractive", "-Command"],
++      shell: "powershell.exe",
++      args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"],
+     };
+   }
+ 
+diff --git a/src/agents/smart-router.ts b/src/agents/smart-router.ts
+index 68aca877a..ff8efac52 100644
+--- a/src/agents/smart-router.ts
++++ b/src/agents/smart-router.ts
+@@ -64,8 +64,47 @@ export class SmartRouter {
+         return usage >= GEMINI_PRO_LIMIT;
+     }
+ 
++    public cleanupPrompt(prompt: string): string {
++        const lower = prompt.trim().toLowerCase();
++        // Standardize prefixes to remove: both !prefix and prefix:
++        const prefixes = [
++            "!kimi", "kimi:", "kimi：",
++            "!flash", "flash:", "flash：",
++            "!pro", "pro:", "pro：",
++            "!deepseek", "deepseek:", "deepseek：",
++            "!gemini", "gemini:", "gemini："
++        ];
++
++        for (const prefix of prefixes) {
++            if (lower.startsWith(prefix)) {
++                // Remove prefix
++                let cleaned = prompt.trim().slice(prefix.length);
++                // Remove optional following colon (En/Cn) or whitespace if not already consumed by prefix
++                cleaned = cleaned.replace(/^[:：\s]+/, "");
++                return cleaned.trim();
++            }
++        }
++        return prompt;
++    }
++
+     public selectModel(taskDescription: string, defaultModelId?: string): string {
+         const lowerTask = taskDescription.toLowerCase();
++
++        // --- 0. Explicit Override (User Force Selection) ---
++        // Supports prefixes like !kimi, kimi:, !flash, flash:
++        if (lowerTask.startsWith("!kimi") || lowerTask.startsWith("kimi:") || lowerTask.startsWith("kimi：")) {
++            return "moonshot/kimi-k2-thinking";
++        }
++        if (lowerTask.startsWith("!flash") || lowerTask.startsWith("flash:") || lowerTask.startsWith("flash：")) {
++            return "google/gemini-3-flash-preview";
++        }
++        if (lowerTask.startsWith("!pro") || lowerTask.startsWith("pro:") || lowerTask.startsWith("pro：")) {
++            return "google/gemini-3-pro-preview";
++        }
++        if (lowerTask.startsWith("!deepseek") || lowerTask.startsWith("deepseek:") || lowerTask.startsWith("deepseek：")) {
++            return "deepseek/deepseek-chat";
++        }
++
+         const category = this.experience.detectCategory(taskDescription);
+         const conservePro = this.shouldConservePro();
+ 
+diff --git a/src/agents/system-prompt.ts b/src/agents/system-prompt.ts
+index 9d914ab13..a3bcf1ca6 100644
+--- a/src/agents/system-prompt.ts
++++ b/src/agents/system-prompt.ts
+@@ -83,21 +83,21 @@ function buildMessagingSection(params: {
+     "- Never use exec/curl for provider messaging; OpenClaw handles all routing internally.",
+     params.availableTools.has("message")
+       ? [
+-          "",
+-          "### message tool",
+-          "- Use `message` for proactive sends + channel actions (polls, reactions, etc.).",
+-          "- For `action=send`, include `to` and `message`.",
+-          `- If multiple channels are configured, pass \`channel\` (${params.messageChannelOptions}).`,
+-          `- If you use \`message\` (\`action=send\`) to deliver your user-visible reply, respond with ONLY: ${SILENT_REPLY_TOKEN} (avoid duplicate replies).`,
+-          params.inlineButtonsEnabled
+-            ? "- Inline buttons supported. Use `action=send` with `buttons=[[{text,callback_data}]]` (callback_data routes back as a user message)."
+-            : params.runtimeChannel
+-              ? `- Inline buttons not enabled for ${params.runtimeChannel}. If you need them, ask to set ${params.runtimeChannel}.capabilities.inlineButtons ("dm"|"group"|"all"|"allowlist").`
+-              : "",
+-          ...(params.messageToolHints ?? []),
+-        ]
+-          .filter(Boolean)
+-          .join("\n")
++        "",
++        "### message tool",
++        "- Use `message` for proactive sends + channel actions (polls, reactions, etc.).",
++        "- For `action=send`, include `to` and `message`.",
++        `- If multiple channels are configured, pass \`channel\` (${params.messageChannelOptions}).`,
++        `- If you use \`message\` (\`action=send\`) to deliver your user-visible reply, respond with ONLY: ${SILENT_REPLY_TOKEN} (avoid duplicate replies).`,
++        params.inlineButtonsEnabled
++          ? "- Inline buttons supported. Use `action=send` with `buttons=[[{text,callback_data}]]` (callback_data routes back as a user message)."
++          : params.runtimeChannel
++            ? `- Inline buttons not enabled for ${params.runtimeChannel}. If you need them, ask to set ${params.runtimeChannel}.capabilities.inlineButtons ("dm"|"group"|"all"|"allowlist").`
++            : "",
++        ...(params.messageToolHints ?? []),
++      ]
++        .filter(Boolean)
++        .join("\n")
+       : "",
+     "",
+   ];
+@@ -179,15 +179,22 @@ export function buildAgentSystemPrompt(params: {
+     channel: string;
+   };
+ }) {
++  const isWindows = params.runtimeInfo?.os?.toLowerCase().includes("windows") ?? false;
+   const coreToolSummaries: Record<string, string> = {
+     read: "Read file contents",
+     write: "Create or overwrite files",
+     edit: "Make precise edits to files",
+     apply_patch: "Apply multi-file patches",
+-    grep: "Search file contents for patterns",
++    grep: isWindows
++      ? "Search file contents (Windows PowerShell: use `Select-String` or its alias `sls`)"
++      : "Search file contents for patterns",
+     find: "Find files by glob pattern",
+-    ls: "List directory contents",
+-    exec: "Run shell commands (pty available for TTY-required CLIs)",
++    ls: isWindows
++      ? "List directory contents (Windows PowerShell: use `ls`, `dir`, or `Get-ChildItem`)"
++      : "List directory contents",
++    exec: isWindows
++      ? "Run shell commands (Windows PowerShell; standard aliases `ls`, `cat`, `rm` available)"
++      : "Run shell commands (pty available for TTY-required CLIs)",
+     process: "Manage background exec sessions",
+     web_search: "Search the web (Brave API)",
+     web_fetch: "Fetch and extract readable content from a URL",
+@@ -282,15 +289,15 @@ export function buildAgentSystemPrompt(params: {
+       : undefined;
+   const reasoningHint = params.reasoningTagHint
+     ? [
+-        "ALL internal reasoning MUST be inside <think>...</think>.",
+-        "Do not output any analysis outside <think>.",
+-        "Format every reply as <think>...</think> then <final>...</final>, with no other text.",
+-        "Only the final user-visible reply may appear inside <final>.",
+-        "Only text inside <final> is shown to the user; everything else is discarded and never seen by the user.",
+-        "Example:",
+-        "<think>Short internal reasoning.</think>",
+-        "<final>Hey there! What would you like to do next?</final>",
+-      ].join(" ")
++      "ALL internal reasoning MUST be inside <think>...</think>.",
++      "Do not output any analysis outside <think>.",
++      "Format every reply as <think>...</think> then <final>...</final>, with no other text.",
++      "Only the final user-visible reply may appear inside <final>.",
++      "Only text inside <final> is shown to the user; everything else is discarded and never seen by the user.",
++      "Example:",
++      "<think>Short internal reasoning.</think>",
++      "<final>Hey there! What would you like to do next?</final>",
++    ].join(" ")
+     : undefined;
+   const reasoningLevel = params.reasoningLevel ?? "off";
+   const userTimezone = params.userTimezone?.trim();
+@@ -336,21 +343,21 @@ export function buildAgentSystemPrompt(params: {
+     toolLines.length > 0
+       ? toolLines.join("\n")
+       : [
+-          "Pi lists the standard tools above. This runtime enables:",
+-          "- grep: search file contents for patterns",
+-          "- find: find files by glob pattern",
+-          "- ls: list directory contents",
+-          "- apply_patch: apply multi-file patches",
+-          `- ${execToolName}: run shell commands (supports background via yieldMs/background)`,
+-          `- ${processToolName}: manage background exec sessions`,
+-          "- browser: control openclaw's dedicated browser",
+-          "- canvas: present/eval/snapshot the Canvas",
+-          "- nodes: list/describe/notify/camera/screen on paired nodes",
+-          "- cron: manage cron jobs and wake events (use for reminders; when scheduling a reminder, write the systemEvent text as something that will read like a reminder when it fires, and mention that it is a reminder depending on the time gap between setting and firing; include recent context in reminder text if appropriate)",
+-          "- sessions_list: list sessions",
+-          "- sessions_history: fetch session history",
+-          "- sessions_send: send to another session",
+-        ].join("\n"),
++        "Pi lists the standard tools above. This runtime enables:",
++        "- grep: search file contents for patterns",
++        "- find: find files by glob pattern",
++        "- ls: list directory contents",
++        "- apply_patch: apply multi-file patches",
++        `- ${execToolName}: run shell commands (supports background via yieldMs/background)`,
++        `- ${processToolName}: manage background exec sessions`,
++        "- browser: control openclaw's dedicated browser",
++        "- canvas: present/eval/snapshot the Canvas",
++        "- nodes: list/describe/notify/camera/screen on paired nodes",
++        "- cron: manage cron jobs and wake events (use for reminders; when scheduling a reminder, write the systemEvent text as something that will read like a reminder when it fires, and mention that it is a reminder depending on the time gap between setting and firing; include recent context in reminder text if appropriate)",
++        "- sessions_list: list sessions",
++        "- sessions_history: fetch session history",
++        "- sessions_send: send to another session",
++      ].join("\n"),
+     "TOOLS.md does not control tool availability; it is user guidance for how to use external tools.",
+     "If a task is more complex or takes longer, spawn a sub-agent. It will do the work for you and ping you when it's done. You can always check up on it.",
+     "",
+@@ -375,11 +382,11 @@ export function buildAgentSystemPrompt(params: {
+     hasGateway && !isMinimal ? "## OpenClaw Self-Update" : "",
+     hasGateway && !isMinimal
+       ? [
+-          "Get Updates (self-update) is ONLY allowed when the user explicitly asks for it.",
+-          "Do not run config.apply or update.run unless the user explicitly requests an update or config change; if it's not explicit, ask first.",
+-          "Actions: config.get, config.schema, config.apply (validate + write full config, then restart), update.run (update deps or git, then restart).",
+-          "After restart, OpenClaw pings the last active session automatically.",
+-        ].join("\n")
++        "Get Updates (self-update) is ONLY allowed when the user explicitly asks for it.",
++        "Do not run config.apply or update.run unless the user explicitly requests an update or config change; if it's not explicit, ask first.",
++        "Actions: config.get, config.schema, config.apply (validate + write full config, then restart), update.run (update deps or git, then restart).",
++        "After restart, OpenClaw pings the last active session automatically.",
++      ].join("\n")
+       : "",
+     hasGateway && !isMinimal ? "" : "",
+     "",
+@@ -403,43 +410,42 @@ export function buildAgentSystemPrompt(params: {
+     params.sandboxInfo?.enabled ? "## Sandbox" : "",
+     params.sandboxInfo?.enabled
+       ? [
+-          "You are running in a sandboxed runtime (tools execute in Docker).",
+-          "Some tools may be unavailable due to sandbox policy.",
+-          "Sub-agents stay sandboxed (no elevated/host access). Need outside-sandbox read/write? Don't spawn; ask first.",
+-          params.sandboxInfo.workspaceDir
+-            ? `Sandbox workspace: ${params.sandboxInfo.workspaceDir}`
+-            : "",
+-          params.sandboxInfo.workspaceAccess
+-            ? `Agent workspace access: ${params.sandboxInfo.workspaceAccess}${
+-                params.sandboxInfo.agentWorkspaceMount
+-                  ? ` (mounted at ${params.sandboxInfo.agentWorkspaceMount})`
+-                  : ""
+-              }`
+-            : "",
+-          params.sandboxInfo.browserBridgeUrl ? "Sandbox browser: enabled." : "",
+-          params.sandboxInfo.browserNoVncUrl
+-            ? `Sandbox browser observer (noVNC): ${params.sandboxInfo.browserNoVncUrl}`
+-            : "",
+-          params.sandboxInfo.hostBrowserAllowed === true
+-            ? "Host browser control: allowed."
+-            : params.sandboxInfo.hostBrowserAllowed === false
+-              ? "Host browser control: blocked."
+-              : "",
+-          params.sandboxInfo.elevated?.allowed
+-            ? "Elevated exec is available for this session."
++        "You are running in a sandboxed runtime (tools execute in Docker).",
++        "Some tools may be unavailable due to sandbox policy.",
++        "Sub-agents stay sandboxed (no elevated/host access). Need outside-sandbox read/write? Don't spawn; ask first.",
++        params.sandboxInfo.workspaceDir
++          ? `Sandbox workspace: ${params.sandboxInfo.workspaceDir}`
++          : "",
++        params.sandboxInfo.workspaceAccess
++          ? `Agent workspace access: ${params.sandboxInfo.workspaceAccess}${params.sandboxInfo.agentWorkspaceMount
++            ? ` (mounted at ${params.sandboxInfo.agentWorkspaceMount})`
++            : ""
++          }`
++          : "",
++        params.sandboxInfo.browserBridgeUrl ? "Sandbox browser: enabled." : "",
++        params.sandboxInfo.browserNoVncUrl
++          ? `Sandbox browser observer (noVNC): ${params.sandboxInfo.browserNoVncUrl}`
++          : "",
++        params.sandboxInfo.hostBrowserAllowed === true
++          ? "Host browser control: allowed."
++          : params.sandboxInfo.hostBrowserAllowed === false
++            ? "Host browser control: blocked."
+             : "",
+-          params.sandboxInfo.elevated?.allowed
+-            ? "User can toggle with /elevated on|off|ask|full."
+-            : "",
+-          params.sandboxInfo.elevated?.allowed
+-            ? "You may also send /elevated on|off|ask|full when needed."
+-            : "",
+-          params.sandboxInfo.elevated?.allowed
+-            ? `Current elevated level: ${params.sandboxInfo.elevated.defaultLevel} (ask runs exec on host with approvals; full auto-approves).`
+-            : "",
+-        ]
+-          .filter(Boolean)
+-          .join("\n")
++        params.sandboxInfo.elevated?.allowed
++          ? "Elevated exec is available for this session."
++          : "",
++        params.sandboxInfo.elevated?.allowed
++          ? "User can toggle with /elevated on|off|ask|full."
++          : "",
++        params.sandboxInfo.elevated?.allowed
++          ? "You may also send /elevated on|off|ask|full when needed."
++          : "",
++        params.sandboxInfo.elevated?.allowed
++          ? `Current elevated level: ${params.sandboxInfo.elevated.defaultLevel} (ask runs exec on host with approvals; full auto-approves).`
++          : "",
++      ]
++        .filter(Boolean)
++        .join("\n")
+       : "",
+     params.sandboxInfo?.enabled ? "" : "",
+     ...buildUserIdentitySection(ownerLine, isMinimal),
+@@ -472,22 +478,22 @@ export function buildAgentSystemPrompt(params: {
+     const guidanceText =
+       level === "minimal"
+         ? [
+-            `Reactions are enabled for ${channel} in MINIMAL mode.`,
+-            "React ONLY when truly relevant:",
+-            "- Acknowledge important user requests or confirmations",
+-            "- Express genuine sentiment (humor, appreciation) sparingly",
+-            "- Avoid reacting to routine messages or your own replies",
+-            "Guideline: at most 1 reaction per 5-10 exchanges.",
+-          ].join("\n")
++          `Reactions are enabled for ${channel} in MINIMAL mode.`,
++          "React ONLY when truly relevant:",
++          "- Acknowledge important user requests or confirmations",
++          "- Express genuine sentiment (humor, appreciation) sparingly",
++          "- Avoid reacting to routine messages or your own replies",
++          "Guideline: at most 1 reaction per 5-10 exchanges.",
++        ].join("\n")
+         : [
+-            `Reactions are enabled for ${channel} in EXTENSIVE mode.`,
+-            "Feel free to react liberally:",
+-            "- Acknowledge messages with appropriate emojis",
+-            "- Express sentiment and personality through reactions",
+-            "- React to interesting content, humor, or notable events",
+-            "- Use reactions to confirm understanding or agreement",
+-            "Guideline: react whenever it feels natural.",
+-          ].join("\n");
++          `Reactions are enabled for ${channel} in EXTENSIVE mode.`,
++          "Feel free to react liberally:",
++          "- Acknowledge messages with appropriate emojis",
++          "- Express sentiment and personality through reactions",
++          "- React to interesting content, humor, or notable events",
++          "- Use reactions to confirm understanding or agreement",
++          "Guideline: react whenever it feels natural.",
++        ].join("\n");
+     lines.push("## Reactions", guidanceText, "");
+   }
+   if (reasoningHint) {
+diff --git a/src/commands/onboard-auth.models.ts b/src/commands/onboard-auth.models.ts
+index de5a4edaa..9cad0a11c 100644
+--- a/src/commands/onboard-auth.models.ts
++++ b/src/commands/onboard-auth.models.ts
+@@ -7,7 +7,7 @@ export const MINIMAX_HOSTED_MODEL_REF = `minimax/${MINIMAX_HOSTED_MODEL_ID}`;
+ export const DEFAULT_MINIMAX_CONTEXT_WINDOW = 200000;
+ export const DEFAULT_MINIMAX_MAX_TOKENS = 8192;
+ 
+-export const MOONSHOT_BASE_URL = "https://api.moonshot.ai/v1";
++export const MOONSHOT_BASE_URL = "https://api.moonshot.cn/v1";
+ export const MOONSHOT_DEFAULT_MODEL_ID = "kimi-k2-0905-preview";
+ export const MOONSHOT_DEFAULT_MODEL_REF = `moonshot/${MOONSHOT_DEFAULT_MODEL_ID}`;
+ export const MOONSHOT_DEFAULT_CONTEXT_WINDOW = 256000;
+diff --git a/src/memory/batch-gemini.ts b/src/memory/batch-gemini.ts
+index 034bdda84..8bb875a1d 100644
+--- a/src/memory/batch-gemini.ts
++++ b/src/memory/batch-gemini.ts
+@@ -2,6 +2,9 @@ import { createSubsystemLogger } from "../logging/subsystem.js";
+ import { isTruthyEnvValue } from "../infra/env.js";
+ import type { GeminiEmbeddingClient } from "./embeddings-gemini.js";
+ import { hashText } from "./internal.js";
++import { resolveProxyFetch } from "../infra/proxy-fetch.js";
++
++const fetch = resolveProxyFetch();
+ 
+ export type GeminiBatchRequest = {
+   custom_id: string;
+@@ -344,21 +347,21 @@ export async function runGeminiEmbeddingBatches(params: {
+     const completed =
+       batchInfo.state && ["SUCCEEDED", "COMPLETED", "DONE"].includes(batchInfo.state)
+         ? {
+-            outputFileId:
+-              batchInfo.outputConfig?.file ??
+-              batchInfo.outputConfig?.fileId ??
+-              batchInfo.metadata?.output?.responsesFile ??
+-              "",
+-          }
++          outputFileId:
++            batchInfo.outputConfig?.file ??
++            batchInfo.outputConfig?.fileId ??
++            batchInfo.metadata?.output?.responsesFile ??
++            "",
++        }
+         : await waitForGeminiBatch({
+-            gemini: params.gemini,
+-            batchName,
+-            wait: params.wait,
+-            pollIntervalMs: params.pollIntervalMs,
+-            timeoutMs: params.timeoutMs,
+-            debug: params.debug,
+-            initial: batchInfo,
+-          });
++          gemini: params.gemini,
++          batchName,
++          wait: params.wait,
++          pollIntervalMs: params.pollIntervalMs,
++          timeoutMs: params.timeoutMs,
++          debug: params.debug,
++          initial: batchInfo,
++        });
+     if (!completed.outputFileId) {
+       throw new Error(`gemini batch ${batchName} completed without output file`);
+     }
+diff --git a/src/memory/embeddings-gemini.ts b/src/memory/embeddings-gemini.ts
+index 2a8ef1a7d..88e8af6fd 100644
+--- a/src/memory/embeddings-gemini.ts
++++ b/src/memory/embeddings-gemini.ts
+@@ -1,8 +1,11 @@
+ import { requireApiKey, resolveApiKeyForProvider } from "../agents/model-auth.js";
+ import { isTruthyEnvValue } from "../infra/env.js";
+ import { createSubsystemLogger } from "../logging/subsystem.js";
++import { resolveProxyFetch } from "../infra/proxy-fetch.js";
+ import type { EmbeddingProvider, EmbeddingProviderOptions } from "./embeddings.js";
+ 
++const fetch = resolveProxyFetch();
++
+ export type GeminiEmbeddingClient = {
+   baseUrl: string;
+   headers: Record<string, string>;
+@@ -118,13 +121,13 @@ export async function resolveGeminiEmbeddingClient(
+   const apiKey = remoteApiKey
+     ? remoteApiKey
+     : requireApiKey(
+-        await resolveApiKeyForProvider({
+-          provider: "google",
+-          cfg: options.config,
+-          agentDir: options.agentDir,
+-        }),
+-        "google",
+-      );
++      await resolveApiKeyForProvider({
++        provider: "google",
++        cfg: options.config,
++        agentDir: options.agentDir,
++      }),
++      "google",
++    );
+ 
+   const providerConfig = options.config.models?.providers?.google;
+   const rawBaseUrl = remoteBaseUrl || providerConfig?.baseUrl?.trim() || DEFAULT_GEMINI_BASE_URL;
+diff --git a/src/utils.ts b/src/utils.ts
+index 86bb1e06f..c508bc1de 100644
+--- a/src/utils.ts
++++ b/src/utils.ts
+@@ -217,6 +217,13 @@ export function resolveConfigDir(
+ ): string {
+   const override = env.OPENCLAW_STATE_DIR?.trim() || env.CLAWDBOT_STATE_DIR?.trim();
+   if (override) return resolveUserPath(override);
++
++  // Custom hardcoded default for this environment
++  const customPath = "F:\\DOCUMENT\\PROMGRAM\\.openclaw";
++  try {
++    if (fs.existsSync(customPath)) return customPath;
++  } catch { }
++
+   const newDir = path.join(homedir(), ".openclaw");
+   try {
+     const hasNew = fs.existsSync(newDir);
