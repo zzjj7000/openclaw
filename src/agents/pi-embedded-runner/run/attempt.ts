@@ -3,7 +3,7 @@ import os from "node:os";
 
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage, ImageContent } from "@mariozechner/pi-ai";
-import { streamSimple } from "@mariozechner/pi-ai";
+import { streamSimple, completeSimple } from "@mariozechner/pi-ai";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -504,6 +504,70 @@ export async function runEmbeddedAttempt(
 
       // Force a stable streamFn reference so vitest can reliably mock @mariozechner/pi-ai.
       activeSession.agent.streamFn = streamSimple;
+
+      // [Kimi/Moonshot Fix] Force non-streaming for Moonshot because streaming response format is incompatible with pi-ai
+      if (params.provider === "moonshot" || params.provider.includes("moonshot")) {
+        log.info(`[Kimi Fix] Forcing non-streaming mode for ${params.provider}/${params.modelId}`);
+
+        // Get API Key from environment once (closure variable)
+        const envApiKey = process.env.MOONSHOT_API_KEY?.trim();
+
+        // Override streamFn to use completeSimple (non-streaming) and convert to stream format
+        activeSession.agent.streamFn = async (model: any, context: any, options: any) => {
+          // [KEY FIX] Inject API Key into the model object passed to THIS function
+          let apiKey = model.apiKey || model.config?.apiKey;
+          if (!apiKey && envApiKey) {
+            apiKey = envApiKey;
+            model.apiKey = apiKey;
+            if (!model.config) model.config = {};
+            model.config.apiKey = apiKey;
+            log.info(`[Kimi Fix] Injected API Key into model (len=${apiKey.length})`);
+          } else if (apiKey) {
+            log.info(`[Kimi Fix] Using existing API Key (len=${apiKey.length})`);
+          } else {
+            log.warn(`[Kimi Fix] No API Key available!`);
+          }
+
+          const fullMsg = await completeSimple(model, context, { ...options, stream: false });
+          log.info(`[Kimi Fix] Non-stream response: ${JSON.stringify(fullMsg).slice(0, 200)}`);
+
+          // Create a generator for yielding chunks
+          async function* generator() {
+            // Yield reasoning if present
+            const reasoning = (fullMsg as any).reasoning || (fullMsg as any).reasoning_content;
+            if (reasoning) {
+              yield { type: "reasoning-delta", text: reasoning };
+            }
+
+            // Yield text content
+            if (typeof fullMsg.content === "string" && fullMsg.content) {
+              yield { type: "text-delta", text: fullMsg.content };
+            } else if (Array.isArray(fullMsg.content)) {
+              for (const block of fullMsg.content) {
+                if (block?.type === "text" && block.text) {
+                  yield { type: "text-delta", text: block.text };
+                }
+              }
+            }
+
+            // Handle error messages from API
+            if ((fullMsg as any).errorMessage) {
+              log.error(`[Kimi Fix] API Error: ${(fullMsg as any).errorMessage}`);
+              yield { type: "text-delta", text: `[Error: ${(fullMsg as any).errorMessage}]` };
+            }
+          }
+
+          // Create stream stub compatible with pi-agent-core
+          const streamStub = {
+            [Symbol.asyncIterator]: () => generator(),
+            result: async () => fullMsg,
+            message: fullMsg,
+            usage: fullMsg.usage || { input: 0, output: 0, totalTokens: 0 },
+            stopReason: fullMsg.stopReason || "end",
+          };
+          return streamStub as any;
+        };
+      }
 
       applyExtraParamsToAgent(
         activeSession.agent,

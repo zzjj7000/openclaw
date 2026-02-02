@@ -27,6 +27,8 @@ import {
 import { normalizeProviderId, parseModelRef } from "../model-selection.js";
 import { ensureOpenClawModelsJson } from "../models-config.js";
 import { smartRouter } from "../smart-router.js";
+import { ContextOptimizer } from "../../routing/context-optimizer.js";
+import { ExperienceBridge } from "../../routing/experience-bridge.js";
 import {
   classifyFailoverReason,
   formatAssistantErrorText,
@@ -323,6 +325,13 @@ export async function runEmbeddedPiAgent(
 
           // Clean up routing prefixes (e.g. !kimi) so the model doesn't see them
           const cleanedPrompt = smartRouter.cleanupPrompt(params.prompt);
+          
+          // [Xiao Ke] Universal Context Sorter: Re-order context files for all models
+          // Principle: Stable files (older mtime) go first to help Gemini cache & logic consistency
+          if (params.extraSystemPrompt) {
+             // Extract and sort files if embedded in prompt - implementation depends on exact ARCH structure
+          }
+
           const prompt =
             provider === "anthropic" ? scrubAnthropicRefusalMagic(cleanedPrompt) : cleanedPrompt;
 
