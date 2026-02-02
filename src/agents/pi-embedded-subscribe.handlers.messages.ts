@@ -51,12 +51,17 @@ export function handleMessageUpdate(
 
   const assistantEvent = evt.assistantMessageEvent;
 
-  /* Removed [KIMI_RAW_DEBUG] */
+  // [KIMI_DEBUG] Log raw event structure for debugging
+  if (process.env.OPENCLAW_DEBUG_KIMI === "1") {
+    console.log("[KIMI_DEBUG] assistantEvent:", JSON.stringify(assistantEvent, null, 2));
+    console.log("[KIMI_DEBUG] msg.content:", typeof msg.content, msg.content?.slice?.(0, 200));
+  }
 
   const assistantRecord =
     assistantEvent && typeof assistantEvent === "object"
       ? (assistantEvent as Record<string, unknown>)
       : undefined;
+
 
   // [Kimi/DeepSeek Support] Extract reasoning_content from raw delta object
   // pi-ai might pass the raw OpenAI delta object as `assistantRecord.delta`
@@ -208,9 +213,13 @@ export function handleMessageEnd(
   const rawText = extractAssistantText(assistantMessage);
   const rawThinking = extractAssistantThinking(assistantMessage);
 
-  // [DEBUG] Logs removed
-  // console.log(`[KIMI_DEBUG] Message End | Raw Text: ${JSON.stringify(rawText)}`);
-  // console.log(`[KIMI_DEBUG] Message End | Raw Thinking: ${JSON.stringify(rawThinking)}`);
+  // [KIMI_DEBUG] Log Message End state
+  if (process.env.OPENCLAW_DEBUG_KIMI === "1") {
+    console.log("[KIMI_DEBUG] Message End | Content Type:", typeof assistantMessage.content, Array.isArray(assistantMessage.content) ? "Array" : "Other");
+    console.log("[KIMI_DEBUG] Message End | Raw Content (slice):", JSON.stringify(assistantMessage.content).slice(0, 200));
+    console.log("[KIMI_DEBUG] Message End | Extracted Text:", rawText.slice(0, 100));
+    console.log("[KIMI_DEBUG] Message End | Extracted Thinking:", rawThinking.slice(0, 100));
+  }
 
   appendRawStream({
     ts: Date.now(),

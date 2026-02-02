@@ -177,15 +177,23 @@ export function extractAssistantText(msg: AssistantMessage): string {
     return rec.type === "text" && typeof rec.text === "string";
   };
 
+  // [Kimi/OpenAI Compatibility] Handle string content directly
+  if (typeof msg.content === "string") {
+    const cleaned = stripThinkingTagsFromText(
+      stripDowngradedToolCallText(stripMinimaxToolCallXml(msg.content)),
+    ).trim();
+    return sanitizeUserFacingText(cleaned);
+  }
+
   const blocks = Array.isArray(msg.content)
     ? msg.content
-        .filter(isTextBlock)
-        .map((c) =>
-          stripThinkingTagsFromText(
-            stripDowngradedToolCallText(stripMinimaxToolCallXml(c.text)),
-          ).trim(),
-        )
-        .filter(Boolean)
+      .filter(isTextBlock)
+      .map((c) =>
+        stripThinkingTagsFromText(
+          stripDowngradedToolCallText(stripMinimaxToolCallXml(c.text)),
+        ).trim(),
+      )
+      .filter(Boolean)
     : [];
   const extracted = blocks.join("\n").trim();
   return sanitizeUserFacingText(extracted);
