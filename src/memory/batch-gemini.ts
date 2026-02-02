@@ -199,7 +199,10 @@ async function fetchGeminiBatchStatus(params: {
     const text = await res.text();
     throw new Error(`gemini batch status failed: ${res.status} ${text}`);
   }
-  return (await res.json()) as GeminiBatchStatus;
+  const rawJson = await res.json();
+  // Always log raw response for debugging batch status issues
+  log.raw(`gemini batch ${params.batchName} raw response: ${JSON.stringify(rawJson)}`);
+  return rawJson as GeminiBatchStatus;
 }
 
 async function fetchGeminiFileContent(params: {
@@ -240,6 +243,9 @@ async function waitForGeminiBatch(params: {
 }): Promise<{ outputFileId: string }> {
   const start = Date.now();
   let current: GeminiBatchStatus | undefined = params.initial;
+  let unknownStateCount = 0;
+  const maxUnknownRetries = 30; // Max 30 consecutive UNKNOWN states before giving up
+
   while (true) {
     const status =
       current ??
@@ -247,7 +253,13 @@ async function waitForGeminiBatch(params: {
         gemini: params.gemini,
         batchName: params.batchName,
       }));
-    const state = status.state ?? "UNKNOWN";
+    const rawState = status.state ?? "UNKNOWN";
+    // Normalize state: handle both "SUCCEEDED" and "JOB_STATE_SUCCEEDED" formats
+    const state = rawState.replace(/^JOB_STATE_/, "");
+
+    // Log current state for debugging
+    log.raw(`gemini batch ${params.batchName} ${rawState} (normalized: ${state}); waiting ${params.pollIntervalMs}ms`);
+
     if (["SUCCEEDED", "COMPLETED", "DONE"].includes(state)) {
       const outputFileId =
         status.outputConfig?.file ??
@@ -262,6 +274,24 @@ async function waitForGeminiBatch(params: {
       const message = status.error?.message ?? "unknown error";
       throw new Error(`gemini batch ${params.batchName} ${state}: ${message}`);
     }
+
+    // Track consecutive UNKNOWN states (only if truly unknown after normalization)
+    if (state === "UNKNOWN") {
+      unknownStateCount++;
+      if (unknownStateCount >= maxUnknownRetries) {
+        throw new Error(
+          `gemini batch ${params.batchName} stuck in UNKNOWN state after ${maxUnknownRetries} retries. ` +
+          `This may indicate the batch API endpoint is not supported or returning an unexpected format. ` +
+          `Raw status: ${JSON.stringify(status)}`
+        );
+      }
+    } else if (!["PENDING", "RUNNING", "PROCESSING", "QUEUED"].includes(state)) {
+      // Unknown state that's not a waiting state - log but continue
+      log.warn(`gemini batch ${params.batchName} unexpected state: ${rawState}`);
+    } else {
+      unknownStateCount = 0; // Reset counter if we see a known state
+    }
+
     if (!params.wait) {
       throw new Error(`gemini batch ${params.batchName} still ${state}; wait disabled`);
     }
@@ -337,15 +367,17 @@ export async function runGeminiEmbeddingBatches(params: {
     if (
       !params.wait &&
       batchInfo.state &&
-      !["SUCCEEDED", "COMPLETED", "DONE"].includes(batchInfo.state)
+      !["SUCCEEDED", "COMPLETED", "DONE", "JOB_STATE_SUCCEEDED"].includes(batchInfo.state)
     ) {
       throw new Error(
         `gemini batch ${batchName} submitted; enable remote.batch.wait to await completion`,
       );
     }
 
+    // Normalize state for comparison
+    const normalizedState = (batchInfo.state ?? "").replace(/^JOB_STATE_/, "");
     const completed =
-      batchInfo.state && ["SUCCEEDED", "COMPLETED", "DONE"].includes(batchInfo.state)
+      normalizedState && ["SUCCEEDED", "COMPLETED", "DONE"].includes(normalizedState)
         ? {
           outputFileId:
             batchInfo.outputConfig?.file ??

@@ -57,6 +57,7 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
     assistantTextBaseline: 0,
     suppressBlockChunks: false, // Avoid late chunk inserts after final text merge.
     lastReasoningSent: undefined,
+    lastActivityMs: Date.now(), // 🛡️ Track last stream activity for stall detection
     compactionInFlight: false,
     pendingCompactionRetry: 0,
     compactionRetryResolve: undefined,
@@ -339,6 +340,10 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
     } else if (input.length - lastIndex > 5000) {
       // 🚨 EMERGENCY ESCAPE: If thinking exceeds 5000 chars without a close tag,
       // it's likely a hallucinated or malformed tag. Force output the rest.
+      log.warn(
+        `[ThinkingEscape] Forced escape from unclosed <think> tag after ${input.length - lastIndex} chars. ` +
+        `This may indicate a malformed or hallucinated thinking tag.`
+      );
       processed += input.slice(lastIndex);
       inThinking = false;
       state.partialTagBuffer = undefined;
@@ -529,15 +534,30 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
     didSendViaMessagingTool: () => messagingToolSentTexts.length > 0,
     getLastToolError: () => (state.lastToolError ? { ...state.lastToolError } : undefined),
     waitForCompactionRetry: () => {
+      // 🛡️ Compaction timeout protection: max 30 seconds
+      const COMPACTION_TIMEOUT_MS = 30_000;
+
+      const createTimeoutPromise = (basePromise: Promise<void>): Promise<void> => {
+        return Promise.race([
+          basePromise,
+          new Promise<void>((resolve) => {
+            setTimeout(() => {
+              log.warn(`[CompactionTimeout] Compaction wait exceeded ${COMPACTION_TIMEOUT_MS}ms, proceeding anyway.`);
+              resolve();
+            }, COMPACTION_TIMEOUT_MS);
+          }),
+        ]);
+      };
+
       if (state.compactionInFlight || state.pendingCompactionRetry > 0) {
         ensureCompactionPromise();
-        return state.compactionRetryPromise ?? Promise.resolve();
+        return createTimeoutPromise(state.compactionRetryPromise ?? Promise.resolve());
       }
       return new Promise<void>((resolve) => {
         queueMicrotask(() => {
           if (state.compactionInFlight || state.pendingCompactionRetry > 0) {
             ensureCompactionPromise();
-            void (state.compactionRetryPromise ?? Promise.resolve()).then(resolve);
+            void createTimeoutPromise(state.compactionRetryPromise ?? Promise.resolve()).then(resolve);
           } else {
             resolve();
           }

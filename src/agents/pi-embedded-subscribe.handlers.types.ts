@@ -53,6 +53,9 @@ export type EmbeddedPiSubscribeState = {
   suppressBlockChunks: boolean;
   lastReasoningSent?: string;
 
+  // 🛡️ Stream activity tracking for detecting stalled streams
+  lastActivityMs: number;
+
   compactionInFlight: boolean;
   pendingCompactionRetry: number;
   compactionRetryResolve?: () => void;

@@ -334,9 +334,26 @@ export function buildAgentSystemPrompt(params: {
     return "You are a personal assistant running inside OpenClaw.";
   }
 
+  // Build Windows shell guidelines section if running on Windows
+  const windowsShellGuidelines = isWindows
+    ? [
+      "## Windows Shell Guidelines",
+      "You are running on Windows with PowerShell. Follow these rules:",
+      "- Use PowerShell syntax, NOT Unix/bash syntax",
+      "- For listing directories: use `Get-ChildItem` or `ls` (but only ONE path per call)",
+      "- WRONG: `ls path1 path2` (Unix multi-path syntax does NOT work in PowerShell)",
+      "- RIGHT: Run separate commands: `ls path1` then `ls path2`",
+      "- Use `Select-String` or `sls` instead of `grep`",
+      "- Use `Get-Content` or `cat` instead of Unix `cat`",
+      "- Use semicolons `;` to chain commands, not `&&`",
+      "",
+    ]
+    : [];
+
   const lines = [
     "You are a personal assistant running inside OpenClaw.",
     "",
+    ...windowsShellGuidelines,
     "## Tooling",
     "Tool availability (filtered by policy):",
     "Tool names are case-sensitive. Call tools exactly as listed.",

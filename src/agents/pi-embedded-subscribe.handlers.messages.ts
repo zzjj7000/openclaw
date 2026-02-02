@@ -46,6 +46,9 @@ export function handleMessageUpdate(
   const msg = evt.message;
   if (msg?.role !== "assistant") return;
 
+  // 🛡️ Update activity timestamp for stall detection
+  ctx.state.lastActivityMs = Date.now();
+
   const assistantEvent = evt.assistantMessageEvent;
 
   /* Removed [KIMI_RAW_DEBUG] */
@@ -68,11 +71,29 @@ export function handleMessageUpdate(
 
   const evtType = typeof assistantRecord?.type === "string" ? assistantRecord.type : "";
 
-  const delta = typeof assistantRecord?.delta === "string" ? assistantRecord.delta : "";
+  // [Kimi/OpenAI Compatibility] delta could be a string OR an object with content field
+  let delta = "";
+  if (typeof assistantRecord?.delta === "string") {
+    delta = assistantRecord.delta;
+  } else if (rawDeltaObj && typeof rawDeltaObj === "object" && "content" in rawDeltaObj) {
+    // Kimi/Moonshot returns delta as { content: "...", reasoning_content?: "..." }
+    const c = rawDeltaObj.content;
+    if (typeof c === "string") {
+      delta = c;
+    }
+  }
   const content = typeof assistantRecord?.content === "string" ? assistantRecord.content : "";
 
+  // [Kimi Compatibility] Allow evtType to be empty for OpenAI-compatible providers
+  // that don't use pi-ai's internal event types
+  const hasContent = delta.length > 0 || content.length > 0;
   if (evtType !== "text_delta" && evtType !== "text_start" && evtType !== "text_end") {
-    return;
+    // If there's no known event type but we have content, treat as text_delta
+    if (!hasContent) {
+      return;
+    }
+    // Log this case for debugging
+    // Note: evtType will be "" for Kimi, so we fallback to treating it as text_delta
   }
 
   appendRawStream({
@@ -86,7 +107,8 @@ export function handleMessageUpdate(
   });
 
   let chunk = "";
-  if (evtType === "text_delta") {
+  // [Kimi Compatibility] Empty evtType with content should be treated as text_delta
+  if (evtType === "text_delta" || (evtType === "" && delta)) {
     chunk = delta;
   } else if (evtType === "text_start" || evtType === "text_end") {
     if (delta) {
@@ -120,9 +142,9 @@ export function handleMessageUpdate(
 
   const next = ctx
     .stripBlockTags(ctx.state.deltaBuffer, {
-      thinking: false,
-      final: false,
-      inlineCode: createInlineCodeState(),
+      thinking: ctx.state.blockState.thinking,
+      final: ctx.state.blockState.final,
+      inlineCode: ctx.state.blockState.inlineCode,
     })
     .trim();
   if (next && next !== ctx.state.lastStreamedAssistant) {
@@ -313,6 +335,10 @@ export function handleMessageEnd(
       }
     }
   }
+
+  // 🛡️ Safety net: Force flush any remaining buffered content before resetting state.
+  // This ensures replies are delivered even if stream parsing state was inconsistent.
+  ctx.flushBlockReplyBuffer();
 
   ctx.state.deltaBuffer = "";
   ctx.state.blockBuffer = "";
