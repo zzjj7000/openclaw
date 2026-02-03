@@ -1,4 +1,4 @@
-import com.android.build.api.variant.impl.VariantOutputImpl
+﻿import com.android.build.api.variant.impl.VariantOutputImpl
 
 plugins {
   id("com.android.application")
@@ -21,8 +21,8 @@ android {
     applicationId = "ai.openclaw.android"
     minSdk = 31
     targetSdk = 36
-    versionCode = 202601290
-    versionName = "2026.1.29"
+    versionCode = 202602030
+    versionName = "2026.2.3"
   }
 
   buildTypes {
@@ -126,3 +126,4 @@ dependencies {
 tasks.withType<Test>().configureEach {
   useJUnitPlatform()
 }
+
