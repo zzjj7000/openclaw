@@ -33,6 +33,7 @@ export const OpenClawSchema = z
       .object({
         lastTouchedVersion: z.string().optional(),
         lastTouchedAt: z.string().optional(),
+        note: z.string().optional(),
       })
       .strict()
       .optional(),
@@ -189,6 +190,7 @@ export const OpenClawSchema = z
                 provider: z.string(),
                 mode: z.union([z.literal("api_key"), z.literal("oauth"), z.literal("token")]),
                 email: z.string().optional(),
+                proxy: z.string().nullable().optional(),
               })
               .strict(),
           )

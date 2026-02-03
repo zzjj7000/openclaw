@@ -41,7 +41,7 @@ const XIAOMI_DEFAULT_COST = {
   cacheWrite: 0,
 };
 
-const MOONSHOT_BASE_URL = process.env.MOONSHOT_BASE_URL ?? process.env.MOONSHOT_API_URL ?? "https://api.moonshot.ai/v1";
+const MOONSHOT_BASE_URL = process.env.MOONSHOT_BASE_URL ?? process.env.MOONSHOT_API_URL ?? "https://api.moonshot.cn/v1";
 const MOONSHOT_DEFAULT_MODEL_ID = "kimi-k2.5";
 const MOONSHOT_DEFAULT_CONTEXT_WINDOW = 256000;
 const MOONSHOT_DEFAULT_MAX_TOKENS = 8192;
@@ -84,6 +84,18 @@ const OLLAMA_DEFAULT_COST = {
   output: 0,
   cacheRead: 0,
   cacheWrite: 0,
+};
+
+const DEEPSEEK_BASE_URL = "https://api.deepseek.com";
+const DEEPSEEK_DEFAULT_MODEL_ID = "deepseek-chat";
+const DEEPSEEK_REASONER_MODEL_ID = "deepseek-reasoner";
+const DEEPSEEK_DEFAULT_CONTEXT_WINDOW = 64000;
+const DEEPSEEK_DEFAULT_MAX_TOKENS = 8192;
+const DEEPSEEK_DEFAULT_COST = {
+  input: 0.14,
+  output: 0.28,
+  cacheRead: 0.014,
+  cacheWrite: 0.14,
 };
 
 interface OllamaModel {
@@ -294,8 +306,8 @@ function buildMoonshotProvider(): ProviderConfig {
         maxTokens: MOONSHOT_DEFAULT_MAX_TOKENS,
       },
       {
-        id: "kimi-k2-thinking",
-        name: "Kimi K2 Thinking",
+        id: "kimi-k2.5-thinking",
+        name: "Kimi K2.5 Thinking",
         reasoning: true,
         input: ["text"],
         cost: MOONSHOT_DEFAULT_COST,
@@ -397,6 +409,33 @@ async function buildOllamaProvider(): Promise<ProviderConfig> {
   };
 }
 
+function buildDeepSeekProvider(): ProviderConfig {
+  return {
+    baseUrl: DEEPSEEK_BASE_URL,
+    api: "openai-completions",
+    models: [
+      {
+        id: DEEPSEEK_DEFAULT_MODEL_ID,
+        name: "DeepSeek Chat",
+        reasoning: false,
+        input: ["text"],
+        cost: DEEPSEEK_DEFAULT_COST,
+        contextWindow: DEEPSEEK_DEFAULT_CONTEXT_WINDOW,
+        maxTokens: DEEPSEEK_DEFAULT_MAX_TOKENS,
+      },
+      {
+        id: DEEPSEEK_REASONER_MODEL_ID,
+        name: "DeepSeek Reasoner",
+        reasoning: true,
+        input: ["text"],
+        cost: DEEPSEEK_DEFAULT_COST,
+        contextWindow: DEEPSEEK_DEFAULT_CONTEXT_WINDOW,
+        maxTokens: DEEPSEEK_DEFAULT_MAX_TOKENS,
+      },
+    ],
+  };
+}
+
 export async function resolveImplicitProviders(params: {
   agentDir: string;
 }): Promise<ModelsConfig["providers"]> {
@@ -461,6 +500,14 @@ export async function resolveImplicitProviders(params: {
     resolveApiKeyFromProfiles({ provider: "ollama", store: authStore });
   if (ollamaKey) {
     providers.ollama = { ...(await buildOllamaProvider()), apiKey: ollamaKey };
+  }
+
+  // DeepSeek provider
+  const deepseekKey =
+    resolveEnvApiKeyVarName("deepseek") ??
+    resolveApiKeyFromProfiles({ provider: "deepseek", store: authStore });
+  if (deepseekKey) {
+    providers.deepseek = { ...buildDeepSeekProvider(), apiKey: deepseekKey };
   }
 
   return providers;

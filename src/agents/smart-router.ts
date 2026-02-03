@@ -4,7 +4,7 @@ import { CONFIG_DIR } from "../utils.js";
 import { modelExperience, ModelExperienceEngine } from "./model-experience.js";
 
 const USAGE_STATS_FILE = "usage-stats.json";
-const GEMINI_PRO_LIMIT = 240; // Adjusted based on 250 limit
+const ROUTER_CONFIG_FILE = "router_config.json";
 
 interface ModelUsage {
     requests: number;
@@ -17,13 +17,45 @@ interface UsageStats {
     models: Record<string, ModelUsage>;
 }
 
+interface RouterConfig {
+    strategies: {
+        context_waterline: {
+            default_limit: number;
+            models: Record<string, number>;
+        };
+        circuit_breaker: {
+            enabled: boolean;
+            max_retries: number;
+            fallback_chain: string[];
+        };
+    };
+    routes: {
+        task_type: string;
+        priority_chain: string[];
+    }[];
+}
+
 export class SmartRouter {
     private experience: ModelExperienceEngine;
     private usageFilePath: string;
+    private configFilePath: string;
+    private config: RouterConfig | null = null;
 
     constructor() {
         this.experience = modelExperience;
         this.usageFilePath = path.join(CONFIG_DIR, USAGE_STATS_FILE);
+        this.configFilePath = path.join(CONFIG_DIR, ROUTER_CONFIG_FILE);
+        this.loadConfig();
+    }
+
+    private loadConfig() {
+        if (fs.existsSync(this.configFilePath)) {
+            try {
+                this.config = JSON.parse(fs.readFileSync(this.configFilePath, "utf-8"));
+            } catch (e) {
+                console.warn("Failed to load router config:", e);
+            }
+        }
     }
 
     private getTodayDate(): string {
@@ -107,67 +139,41 @@ export class SmartRouter {
         return prompt;
     }
 
-    public selectModel(taskDescription: string, defaultModelId?: string): string {
+    public selectModel(taskDescription: string, contextTokens: number = 0): string {
+        // Reload config on every request to allow hot-swapping
+        this.loadConfig();
+
         const lowerTask = taskDescription.toLowerCase();
 
-        if (lowerTask.startsWith("!kimi") || lowerTask.startsWith("kimi:") || lowerTask.startsWith("kimi：")) {
-            return "moonshot/kimi-k2-thinking";
-        }
-        if (lowerTask.startsWith("!flash") || lowerTask.startsWith("flash:") || lowerTask.startsWith("flash：")) {
-            return "google/gemini-3-flash-preview";
-        }
-        if (lowerTask.startsWith("!pro") || lowerTask.startsWith("pro:") || lowerTask.startsWith("pro：")) {
-            return "google/gemini-3-pro-preview";
-        }
-        if (lowerTask.startsWith("!deepseek") || lowerTask.startsWith("deepseek:") || lowerTask.startsWith("deepseek：")) {
-            return "deepseek/deepseek-chat";
-        }
+        // 1. Manual Overrides (Highest Priority)
+        if (lowerTask.startsWith("!kimi") || lowerTask.startsWith("kimi:") || lowerTask.startsWith("kimi：")) return "moonshot/kimi-k2.5-thinking";
+        if (lowerTask.startsWith("!flash") || lowerTask.startsWith("flash:") || lowerTask.startsWith("flash：")) return "google/gemini-3-flash-preview";
+        if (lowerTask.startsWith("!pro") || lowerTask.startsWith("pro:") || lowerTask.startsWith("pro：")) return "google/gemini-3-pro-preview";
+        if (lowerTask.startsWith("!deepseek") || lowerTask.startsWith("deepseek:") || lowerTask.startsWith("deepseek：")) return "deepseek/deepseek-chat";
 
+        // 2. Determine Task Category
         const category = this.experience.detectCategory(taskDescription);
-        const conservePro = this.shouldConservePro();
-
-        let championId: string | undefined;
-        let maxScore = -1;
-
-        const allModels = this.experience.getAllModels();
-        for (const model of allModels) {
-            if (model.totalUses > 5) {
-                const score = model.scores[category] || 0;
-                if (score > maxScore && score >= 80) {
-                    maxScore = score;
-                    championId = model.id;
-                }
+        
+        // 3. Resolve Priority Chain from Config
+        let chain: string[] = ["google/gemini-3-flash-preview"]; // Default fallback
+        if (this.config) {
+            const route = this.config.routes.find(r => r.task_type === category) || 
+                          this.config.routes.find(r => r.task_type === "default");
+            if (route) {
+                chain = route.priority_chain;
             }
         }
 
-        if (championId) {
-            if (championId === "google/gemini-3-pro-preview" && conservePro) {
-                // Fallthrough
-            } else {
-                return championId;
-            }
-        }
+        // 4. Waterline Filtering
+        const validModels = chain.filter(modelId => {
+            if (!this.config) return true;
+            const limit = this.config.strategies.context_waterline.models[modelId] || 
+                          this.config.strategies.context_waterline.default_limit;
+            return contextTokens < limit;
+        });
 
-        if (category === "architecture" || category === "creative") {
-            const proUsage = this.getUsage("google/gemini-3-pro-preview");
-            if (proUsage.requests < 250) {
-                return "google/gemini-3-pro-preview";
-            }
-        }
-
-        if (category === "backend" || category === "debugging" || category === "coding") {
-            return "moonshot/kimi-k2-thinking";
-        }
-
-        if (category === "frontend") {
-            return "moonshot/kimi-k2.5";
-        }
-
-        if (category === "general" || lowerTask.includes("simple") || lowerTask.includes("translate") || lowerTask.includes("weather")) {
-            return "google/gemini-3-flash-preview";
-        }
-
-        return "google/gemini-3-flash-preview";
+        // 5. Select Best Available
+        return validModels.length > 0 ? validModels[0] : "google/gemini-3-flash-preview";
     }
 }
 

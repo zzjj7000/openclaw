@@ -505,68 +505,100 @@ export async function runEmbeddedAttempt(
       // Force a stable streamFn reference so vitest can reliably mock @mariozechner/pi-ai.
       activeSession.agent.streamFn = streamSimple;
 
-      // [Kimi/Moonshot Fix] Force non-streaming for Moonshot because streaming response format is incompatible with pi-ai
+      // [Kimi/Moonshot Fix] Inject API Key for Moonshot provider
+      // Note: Previously forced non-streaming, now trying streaming mode after URL fix
       if (params.provider === "moonshot" || params.provider.includes("moonshot")) {
-        log.info(`[Kimi Fix] Forcing non-streaming mode for ${params.provider}/${params.modelId}`);
-
-        // Get API Key from environment once (closure variable)
         const envApiKey = process.env.MOONSHOT_API_KEY?.trim();
 
-        // Override streamFn to use completeSimple (non-streaming) and convert to stream format
-        activeSession.agent.streamFn = async (model: any, context: any, options: any) => {
-          // [KEY FIX] Inject API Key into the model object passed to THIS function
-          let apiKey = model.apiKey || model.config?.apiKey;
-          if (!apiKey && envApiKey) {
-            apiKey = envApiKey;
-            model.apiKey = apiKey;
-            if (!model.config) model.config = {};
-            model.config.apiKey = apiKey;
-            log.info(`[Kimi Fix] Injected API Key into model (len=${apiKey.length})`);
-          } else if (apiKey) {
-            log.info(`[Kimi Fix] Using existing API Key (len=${apiKey.length})`);
-          } else {
-            log.warn(`[Kimi Fix] No API Key available!`);
-          }
-
-          const fullMsg = await completeSimple(model, context, { ...options, stream: false });
-          log.info(`[Kimi Fix] Non-stream response: ${JSON.stringify(fullMsg).slice(0, 200)}`);
-
-          // Create a generator for yielding chunks
-          async function* generator() {
-            // Yield reasoning if present
-            const reasoning = (fullMsg as any).reasoning || (fullMsg as any).reasoning_content;
-            if (reasoning) {
-              yield { type: "reasoning-delta", text: reasoning };
+        if (envApiKey) {
+          // Wrap streamFn to inject API Key before each call
+          const originalStreamFn = activeSession.agent.streamFn;
+          activeSession.agent.streamFn = async (model: any, context: any, options: any) => {
+            // Inject API Key into model
+            if (!model.apiKey && !model.config?.apiKey) {
+              model.apiKey = envApiKey;
+              if (!model.config) model.config = {};
+              model.config.apiKey = envApiKey;
+              log.info(`[Kimi] Injected API Key (len=${envApiKey.length})`);
             }
 
-            // Yield text content
-            if (typeof fullMsg.content === "string" && fullMsg.content) {
-              yield { type: "text-delta", text: fullMsg.content };
-            } else if (Array.isArray(fullMsg.content)) {
-              for (const block of fullMsg.content) {
-                if (block?.type === "text" && block.text) {
-                  yield { type: "text-delta", text: block.text };
+            // Debug: Log message roles to identify ROLE_UNSPECIFIED issue
+            if (context?.messages && Array.isArray(context.messages)) {
+              const roles = context.messages.map((m: any, i: number) => `${i}:${m.role || 'EMPTY'}`);
+              log.info(`[Kimi Debug] Message roles: ${roles.join(', ')}`);
+
+              // Valid OpenAI-compatible roles for Moonshot
+              const validOpenAIRoles = new Set(['system', 'user', 'assistant', 'tool']);
+
+              // Convert pi-ai roles to OpenAI-compatible roles
+              for (const m of context.messages) {
+                if (m.role === 'toolResult') {
+                  // pi-ai uses 'toolResult', OpenAI/Moonshot uses 'tool'
+                  m.role = 'tool';
+
+                  // Convert toolCallId to tool_call_id (OpenAI format)
+                  if (m.toolCallId && !m.tool_call_id) {
+                    m.tool_call_id = m.toolCallId;
+                  }
+
+                  // Ensure content is a string (Moonshot requires string content)
+                  if (m.content && Array.isArray(m.content)) {
+                    // Extract text from content array
+                    const textParts = m.content
+                      .filter((c: any) => c.type === 'text' && c.text)
+                      .map((c: any) => c.text);
+                    m.content = textParts.join('\n') || JSON.stringify(m.content);
+                  } else if (m.content && typeof m.content === 'object') {
+                    m.content = JSON.stringify(m.content);
+                  }
+
+              log.info(`[Kimi] Converted toolResult -> tool (id=${m.tool_call_id?.slice?.(0, 20)}...)`);
+            }
+
+                // Also fix assistant messages with tool_calls
+                if (m.role === 'assistant' && m.toolCalls && !m.tool_calls) {
+                  m.tool_calls = m.toolCalls.map((tc: any) => ({
+                    id: tc.id || tc.toolCallId,
+                    type: 'function',
+                    function: {
+                      name: tc.name || tc.toolName,
+                      arguments: typeof tc.input === 'string' ? tc.input : JSON.stringify(tc.input || {}),
+                    },
+                  }));
+                  log.info(`[Kimi] Converted assistant toolCalls -> tool_calls`);
                 }
+              }
+
+              // Now filter out any remaining invalid roles
+              const filteredMessages = context.messages.filter((m: any) => {
+                const role = m.role?.trim?.();
+                if (!role || !validOpenAIRoles.has(role)) {
+                  log.warn(`[Kimi] Filtering out message with invalid role: ${JSON.stringify(m).slice(0, 100)}`);
+                  return false;
+                }
+                return true;
+              });
+
+              if (filteredMessages.length !== context.messages.length) {
+                log.warn(`[Kimi] Filtered ${context.messages.length - filteredMessages.length} messages with invalid roles`);
+                context.messages = filteredMessages;
               }
             }
 
-            // Handle error messages from API
-            if ((fullMsg as any).errorMessage) {
-              log.error(`[Kimi Fix] API Error: ${(fullMsg as any).errorMessage}`);
-              yield { type: "text-delta", text: `[Error: ${(fullMsg as any).errorMessage}]` };
+            // Use original streaming function with error handling
+            try {
+              log.info(`[Kimi] Calling stream with ${context?.messages?.length || 0} messages`);
+              const result = await originalStreamFn(model, context, options);
+              log.info(`[Kimi] Stream call returned successfully`);
+              return result;
+            } catch (err: any) {
+              log.error(`[Kimi] Stream error: ${err?.message || err}`);
+              log.error(`[Kimi] Error details: ${JSON.stringify(err?.response?.data || err?.cause || 'no details')}`);
+              throw err;
             }
-          }
-
-          // Create stream stub compatible with pi-agent-core
-          const streamStub = {
-            [Symbol.asyncIterator]: () => generator(),
-            result: async () => fullMsg,
-            message: fullMsg,
-            usage: fullMsg.usage || { input: 0, output: 0, totalTokens: 0 },
-            stopReason: fullMsg.stopReason || "end",
           };
-          return streamStub as any;
-        };
+          log.info(`[Kimi] Using streaming mode for ${params.provider}/${params.modelId}`);
+        }
       }
 
       applyExtraParamsToAgent(

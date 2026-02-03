@@ -33,30 +33,60 @@ export interface ExperienceData {
 
 const DEFAULT_EXPERIENCE: ExperienceData = {
     models: {
-        "google/gemini-3-pro-preview": {
-            id: "google/gemini-3-pro-preview",
-            tags: ["expert", "complex", "creative"],
-            totalUses: 0,
-            scores: { frontend: 85, backend: 95, architecture: 98, debugging: 90, creative: 95, coding: 92, general: 100 },
-        },
-        "moonshot/kimi-k2-thinking": {
-            id: "moonshot/kimi-k2-thinking",
-            tags: ["coding", "logic"],
-            totalUses: 0,
-            scores: { frontend: 92, backend: 96, architecture: 85, debugging: 98, creative: 80, coding: 95, general: 80 },
-        },
-        "moonshot/kimi-k2.5": {
-            id: "moonshot/kimi-k2.5",
-            tags: ["coding", "logic"],
-            totalUses: 0,
-            scores: { frontend: 90, backend: 92, architecture: 80, debugging: 90, creative: 75, coding: 92, general: 80 },
-        },
-        "google/gemini-3-flash-preview": {
-            id: "google/gemini-3-flash-preview",
-            tags: ["fast", "simple", "crud"],
-            totalUses: 0,
-            scores: { frontend: 88, backend: 75, architecture: 60, debugging: 70, creative: 85, coding: 70, general: 85 },
-        },
+    "google/gemini-3-pro-preview": {
+      id: "google/gemini-3-pro-preview",
+      tags: ["expert", "complex", "creative"],
+      totalUses: 0,
+      scores: { frontend: 85, backend: 95, architecture: 98, debugging: 90, creative: 95, coding: 92, general: 100 },
+    },
+    "moonshot/kimi-k2.5-thinking": {
+      id: "moonshot/kimi-k2.5-thinking",
+      tags: ["coding", "logic"],
+      totalUses: 0,
+      scores: { frontend: 92, backend: 96, architecture: 85, debugging: 98, creative: 80, coding: 95, general: 80 },
+    },
+    "moonshot/kimi-k2.5": {
+      id: "moonshot/kimi-k2.5",
+      tags: ["coding", "logic"],
+      totalUses: 0,
+      scores: { frontend: 90, backend: 92, architecture: 80, debugging: 90, creative: 75, coding: 92, general: 80 },
+    },
+    "anthropic/claude-4.5-sonnet": {
+      id: "anthropic/claude-4.5-sonnet",
+      tags: ["expert", "coding", "reasoning"],
+      totalUses: 0,
+      scores: { frontend: 98, backend: 98, architecture: 98, debugging: 99, creative: 95, coding: 99, general: 95 },
+    },
+    "anthropic/claude-4.5-opus": {
+      id: "anthropic/claude-4.5-opus",
+      tags: ["expert", "complex", "research"],
+      totalUses: 0,
+      scores: { frontend: 95, backend: 99, architecture: 100, debugging: 98, creative: 98, coding: 98, general: 96 },
+    },
+    "openai/gpt-5.2": {
+      id: "openai/gpt-5.2",
+      tags: ["vision", "reasoning", "all-rounder"],
+      totalUses: 0,
+      scores: { frontend: 90, backend: 90, architecture: 92, debugging: 90, creative: 85, coding: 88, general: 95 },
+    },
+    "minimax/abab-7": {
+      id: "minimax/abab-7",
+      tags: ["creative", "chinese-optimized"],
+      totalUses: 0,
+      scores: { frontend: 75, backend: 70, architecture: 65, debugging: 60, creative: 92, coding: 60, general: 80 },
+    },
+    "deepseek/deepseek-chat": {
+      id: "deepseek/deepseek-chat",
+      tags: ["fast", "cheap", "logic"],
+      totalUses: 0,
+      scores: { frontend: 85, backend: 85, architecture: 80, debugging: 85, creative: 70, coding: 85, general: 85 },
+    },
+    "google/gemini-3-flash-preview": {
+      id: "google/gemini-3-flash-preview",
+      tags: ["fast", "simple", "crud"],
+      totalUses: 0,
+      scores: { frontend: 88, backend: 75, architecture: 60, debugging: 70, creative: 85, coding: 70, general: 85 },
+    },
     },
     recentTasks: [],
 };
