@@ -105,7 +105,8 @@ export async function runEmbeddedPiAgent(
 
       try {
         if (params.prompt) {
-          const smartSelection = smartRouter.selectModel(params.prompt, `${provider}/${modelId}`);
+          // [Xiao Ke Fix] Ensure the second argument is a number (tokens), not a string
+          const smartSelection = smartRouter.selectModel(params.prompt, DEFAULT_CONTEXT_TOKENS);
           const parsedSmart = parseModelRef(smartSelection, provider);
           if (parsedSmart && (parsedSmart.provider !== provider || parsedSmart.model !== modelId)) {
             log.info(`[Smart Router] Switching model from ${provider}/${modelId} to ${parsedSmart.provider}/${parsedSmart.model} based on task.`);

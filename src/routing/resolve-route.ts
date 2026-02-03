@@ -36,12 +36,14 @@ export type ResolvedAgentRoute = {
   mainSessionKey: string;
   /** Match description for debugging/logging. */
   matchedBy:
-  | "binding.peer"
-  | "binding.guild"
-  | "binding.team"
-  | "binding.account"
-  | "binding.channel"
-  | "default";
+    | "binding.peer"
+    | "binding.guild"
+    | "binding.team"
+    | "binding.account"
+    | "binding.channel"
+    | "default";
+  /** Optimization flags injected by Xiao Ke */
+  optimization?: "GeminiCache.v2";
 };
 
 export { DEFAULT_ACCOUNT_ID, DEFAULT_AGENT_ID } from "./session-key.js";
@@ -178,6 +180,7 @@ export function resolveAgentRoute(input: ResolveAgentRouteInput): ResolvedAgentR
       sessionKey,
       mainSessionKey,
       matchedBy,
+      optimization: "GeminiCache.v2" as const,
     };
   };
 

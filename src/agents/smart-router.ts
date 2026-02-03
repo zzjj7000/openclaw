@@ -115,8 +115,9 @@ export class SmartRouter {
     }
 
     public shouldConservePro(): boolean {
+        // Simple heuristic: if requests > 240, start conserving
         const usage = this.getUsage("google/gemini-3-pro-preview");
-        return usage.requests >= GEMINI_PRO_LIMIT;
+        return usage.requests >= 240;
     }
 
     public cleanupPrompt(prompt: string): string {
